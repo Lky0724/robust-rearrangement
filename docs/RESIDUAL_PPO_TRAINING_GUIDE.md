@@ -2,14 +2,15 @@
 
 How `src/train/residual_ppo.py` trains the residual policy on top of a frozen diffusion base policy: what a run does, what the console output means, and which metrics to watch.
 
-Numbers in the examples are from a real `one_leg` / low-randomness run on an RTX 3000 Ada laptop GPU (8 GB):
+The training command is the paper-consistent one from the Implementation Guide (Stage 2a). Its values match paper Tables VI and IX; §7 explains each parameter.
 
 ```bash
-python -m src.train.residual_ppo \
-    base_policy.wt_path=checkpoints/bc/one_leg/low/actor_chkpt.pt \
-    env.task=one_leg env.randomness=low \
-    num_env_steps=700 num_envs=1024 total_timesteps=500000000
+python -m src.train.residual_ppo base_policy.wt_path=<bc ckpt> \
+  env.task=one_leg env.randomness=low num_env_steps=700 num_envs=1024 \
+  total_timesteps=500000000 debug=false
 ```
+
+Numbers in the examples are from running this command with `<bc ckpt>` = `checkpoints/bc/one_leg/low/actor_chkpt.pt` (the released low-randomness BC policy) on an RTX 3000 Ada laptop GPU (8 GB).
 
 ---
 
@@ -29,7 +30,7 @@ Only π_res (actor + critic) is trained, with PPO, from sparse task rewards in I
 
 ### 2.1 Setup (once, at start)
 
-1. Load π_base from `base_policy.wt_path` (or `base_policy.wandb_id`). The checkpoint's own config **overrides** `cfg.actor` (`src/common/config_util.py`), so base-policy settings such as `actor.inference_steps` can't be changed from the command line.
+1. Load π_base from `base_policy.wt_path` (or `base_policy.wandb_id`). The checkpoint's own config **overrides** `cfg.actor` (`src/common/config_util.py`), so base-policy settings can't be changed from the command line. The script then **hard-codes 4 DDIM inference steps** for the diffusion base (`agent.inference_steps = 4` in `residual_ppo.py`), whatever the checkpoint says. That matches paper Table IV.
 2. Build 1024 parallel IsaacGym envs, the residual policy, and two Adam optimizers with cosine LR schedules (actor 3e-4, critic 5e-3).
 3. Derive the run size from the config:
 
@@ -72,7 +73,7 @@ Two consequences:
 │
 ├─ 2. Rollout ── 700 steps × 1024 envs                              (~190 s, ~92% of time)
 │     for each step:
-│       base_action   = π_base(obs)            # frozen diffusion; DDIM steps from the BC ckpt (16 released, 4 in paper)
+│       base_action   = π_base(obs)            # frozen diffusion, 4 DDIM steps per replan (every 8 steps)
 │       residual, logp, value = π_res(obs ⊕ base_action)
 │       action        = base_action + 0.1 × residual
 │       obs, reward, done = env.step(action)   # reward normalized by running std, clipped at 5
@@ -100,7 +101,7 @@ An **eval iteration** does steps 1–3 with mean residual actions, saves the che
 | One training iteration | ~207 s |
 | One eval iteration | ~190 s |
 
-Full example run: `697 × 207 s + ~175 × 190 s ≈ 47 h`. See §6 for how to shorten it.
+Full example run: `697 × 207 s + ~175 × 190 s ≈ 47 h`. In practice you don't need all of it: the authors' `one_leg` low checkpoint was saved at ~175M steps. See §6.
 
 ---
 
@@ -194,10 +195,11 @@ The rollout takes ~92% of the time and the GPU is compute-bound (~98% utilizatio
 
 | Change | Effect | Caveat |
 |---|---|---|
-| Lower `total_timesteps`, e.g. `150_000_000` | ~47 h → ~14 h. The cosine LR schedule shrinks to match. | Pick a budget near where eval SR plateaus. Better than killing a long run early, when the LR is still high. |
+| Stop early by hand once `eval/success_rate` flattens, keeping `total_timesteps=500000000` | The released `one_leg` low checkpoint was saved after 244 iterations ≈ **175M** steps; med after 932 ≈ **668M** (scheduler `last_epoch` × 716,800; matches paper Figs. 26 and 27b). For low that's ~14–16 h instead of ~47 h. | Keeps the same cosine LR schedule as the authors' run. Lowering `total_timesteps` would shorten the run too, but it makes the LR decay faster than theirs. |
 | `eval_interval=10` (or 20) | Cuts eval overhead from ~20% to ~10% (or ~5%). | Fewer chances to catch a peak for the best checkpoint. |
-| Fewer diffusion `inference_steps` (16 → 4) | The released BC checkpoints use 16; the paper's base policy uses 4 (Table IV). Cuts base-policy inference time in the rollout. | Comes from the BC checkpoint, so the command line can't change it. Either train π_base with `actor.inference_steps=4` (Implementation Guide 1c), or change the code to set `base_cfg.actor.inference_steps` before the agent is built. Check the base SR at 4 steps first. |
 | `wandb.mode=offline` | Minor. | Sync afterwards with `wandb sync`. |
+
+The base policy already runs with only 4 DDIM steps (hard-coded, see §2.1), so there's little left to gain from cutting diffusion inference.
 
 What **not** to change for speed:
 
@@ -207,20 +209,146 @@ What **not** to change for speed:
 
 ---
 
-## 7. Key config reference (`src/config/base_residual_rl.yaml`)
+## 7. Parameter reference
 
-| Key | Default | Role |
+All parameters are Hydra overrides of `src/config/base_residual_rl.yaml` (plus `src/config/actor/residual_diffusion.yaml` for `actor.residual_policy.*`). Pass them as `key=value` after the module name. In the tables:
+
+- **Paper** gives the value from paper Tables VI and IX, where the paper lists one. A dash means the paper doesn't list it.
+- ⚠️ marks a parameter whose value in the repo does nothing or is overridden.
+
+### 7.1 The command, parameter by parameter
+
+```bash
+python -m src.train.residual_ppo base_policy.wt_path=<bc ckpt> \
+  env.task=one_leg env.randomness=low num_env_steps=700 num_envs=1024 \
+  total_timesteps=500000000 debug=false
+```
+
+| Parameter | Value | What it does |
 |---|---|---|
-| `num_envs` | 1024 | Parallel sim envs |
-| `num_env_steps` | 700 | Rollout length = max episode length |
-| `total_timesteps` | 1e9 | Training budget, sets `num_iterations` and the LR schedule length |
-| `eval_interval` / `eval_first` | 5 / true | Eval frequency; eval at iteration 1 |
-| `checkpoint_interval` | −1 | Periodic snapshots (off) |
-| `update_epochs` / `num_minibatches` | 50 / 1 | PPO epochs over the full batch |
-| `learning_rate_actor` / `learning_rate_critic` | 3e-4 / 5e-3 | Cosine schedule, actor warmup 5 iterations |
-| `discount` / `gae_lambda` | 0.999 / 0.95 | GAE |
-| `clip_coef` / `target_kl` | 0.2 / 0.1 | PPO trust region, KL early stop |
-| `normalize_reward` / `clip_reward` | true / 5.0 | Reward divided by running std, then clipped |
-| `actor.residual_policy.action_scale` | 0.1 | Residual scale relative to the base action |
-| `actor.residual_policy.init_logstd` / `learn_std` | −1.0 / false | Fixed exploration noise (std ≈ 0.37) |
-| `reset_every_iteration` | true | Reset all envs at the start of each iteration |
+| `python -m src.train.residual_ppo` | — | Runs the residual PPO trainer. Run it from the repo root. Checkpoints go to `./models/<run_name>/`, relative to where you launch. |
+| `base_policy.wt_path` | `<bc ckpt>`: path to a BC `.pt`, e.g. the released `checkpoints/bc/one_leg/low/actor_chkpt.pt` or your own from Implementation Guide 1c | The frozen base policy π_base. The file must contain `config` (the BC run's config, which replaces `cfg.actor`) and the weights with the normalizer. Use either this or `base_policy.wandb_id`. |
+| `env.task` | `one_leg` | Task to train on. Sets the IsaacGym assets, the reward (+1 per newly assembled part pair) and `n_parts_to_assemble` (1 for `one_leg`), which defines success. Must match the task π_base was trained on. |
+| `env.randomness` | `low` | Initial part-pose randomization: `low` or `med` in the paper. Must match the level π_base was trained on, because the normalizer and the demos come from that level. |
+| `num_env_steps` | 700 | Episode length and rollout length. Each iteration steps every env 700 times, and the env wrapper truncates at 700. Paper: 700 for `one_leg`, 1000 for lamp and round table. It also sets `data_collection_steps`, and through that `batch_size`. |
+| `num_envs` | 1024 | Number of parallel IsaacGym envs. It sets throughput, GPU memory use and `batch_size = num_env_steps × num_envs` (716,800). Paper: 1024. |
+| `total_timesteps` | 500,000,000 | Training budget in env steps, counting training iterations only. It sets `num_iterations = total_timesteps // batch_size` (697), which is also the length of the cosine LR schedule. Paper: 500M (a cap). The released low checkpoint peaked at ~175M. |
+| `debug` | `false` | Already the default; the command keeps it explicit. `true` disables wandb logging entirely. |
+
+The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation Guide, Stage 0), runs log there. To pick one per run, add `wandb.entity=<you>` (see 7.5).
+
+### 7.2 Base policy
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `base_policy.wt_path` | `null` | Local BC checkpoint (see 7.1). |
+| `base_policy.wandb_id` | `null` | Alternative to `wt_path`: `<project>/<run_id>` of a BC wandb run. It takes precedence over `wt_path` if both are set. |
+| `base_policy.wt_type` | `best_success_rate` | Which checkpoint file to fetch from the wandb run: `best_success_rate`, `best_test_loss` or `last`. Only used with `wandb_id`. |
+| Diffusion inference steps | 4, hard-coded ⚠️ | Not a config key. `residual_ppo.py` sets `agent.inference_steps = 4` after loading, overriding the checkpoint's value. Paper Table IV: 4. |
+| `observation_type` | `state` | Must be `state`: `ResidualDiffusionPolicy` asserts it. The residual stage is state-only. |
+
+### 7.3 Environment and control
+
+| Parameter | Default | Paper | What it does |
+|---|---|---|---|
+| `env.task` | `one_leg` | — | See 7.1. |
+| `env.randomness` | `low` | — | See 7.1. |
+| `control.controller` | `diffik` | — | Low-level controller that turns end-effector targets into joint commands. Must match π_base. |
+| `control.control_mode` | `pos` | Absolute EE pose | `pos` = absolute pose actions, `delta` = relative. Must match π_base. |
+| `control.act_rot_repr` | `rot_6d` | 6D | Rotation representation in the 10-D action. Must match π_base. |
+| `sample_perturbations` | `false` | — | `true` applies random forces and torques to parts every step during training. It's a robustness ablation (paper Table XIV), not part of the main recipe. |
+| `reset_every_iteration` | `true` | — | Reset all envs at the start of every iteration, so each rollout is 700 steps of fresh episodes. Eval iterations always reset. |
+| `truncation_as_done` | `true` | — | Treats hitting step 700 as a terminal state for GAE (no bootstrapping past the time limit). |
+| `reset_on_success` / `reset_on_failure` | `true` / `false` | — | ⚠️ No effect: the env wrapper stores them but never reads them. Envs don't auto-reset mid-rollout; a successful env just stays assembled until the next iteration's reset. |
+| `headless` | `true` | — | `false` opens the IsaacGym viewer. That's very slow at 1024 envs, so use it only for debugging with few envs. |
+| `gpu_id` | 0 | — | CUDA device used for simulation, rendering and the networks. |
+
+### 7.4 Rollout, batch and iteration sizing
+
+| Parameter | Default | Paper | What it does |
+|---|---|---|---|
+| `num_envs` | 1024 | 1024 | See 7.1. |
+| `num_env_steps` | 700 | 700 (`one_leg`) | See 7.1. |
+| `data_collection_steps` | `${num_env_steps}` | — | Steps collected per iteration. Leave it tied to `num_env_steps`. |
+| `total_timesteps` | 1,000,000,000 | 500M | See 7.1. The config default is 2× the paper's cap. |
+| `batch_size` | derived | — | `data_collection_steps × num_envs`. Don't override it. |
+| `num_minibatches` | 1 | 1 | Minibatches per PPO epoch. With 1, each epoch is a single gradient step on the full 716,800-sample batch. |
+| `minibatch_size` | derived | — | `batch_size // num_minibatches`. |
+| `num_iterations` | derived | — | `total_timesteps // batch_size`. The number of training iterations, and the LR schedule length. |
+
+### 7.5 Evaluation, checkpointing and resuming
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `eval_interval` | 5 | Every `eval_interval`-th iteration is a deterministic evaluation: mean residual action, no update, `global_step` doesn't advance. |
+| `eval_first` | `true` | Shifts the schedule so iteration 1 is an eval, which measures the untrained residual (≈ base policy SR). |
+| `checkpoint_interval` | −1 | Save `actor_chkpt_<iteration>.pt` every N iterations. −1 = off. Each file is ~266 MB (see §5). The best-SR checkpoint is saved regardless. |
+| `wandb.entity` | `null` | wandb user or team. `null` falls back to `WANDB_ENTITY` or your login's default entity. |
+| `wandb.project` | `${env.task}-residual-rl` | wandb project, e.g. `one_leg-residual-rl`. |
+| `wandb.mode` | `online` | `online`, `offline` (sync later with `wandb sync`) or `disabled`. |
+| `wandb.notes` | `null` | Free-text notes attached to the run. |
+| `wandb.continue_run_id` | `null` | Resume an existing run by id, in `wandb.project`. It reloads that run's config, most recent checkpoint, optimizer and LR-scheduler state, iteration count and best SR. If the run doesn't exist, a fresh run starts. |
+| `seed` | `null` | Random seed. `null` draws a random one, which appears at the end of the run name (`…_ppo__<seed>`). |
+| `torch_deterministic` | `false` | Sets `cudnn.deterministic`. The physics sim is not fully deterministic anyway. |
+
+### 7.6 Residual policy (`actor.residual_policy.*`)
+
+| Parameter | Default | Paper | What it does |
+|---|---|---|---|
+| `action_scale` | 0.1 | 0.1 | α in `action = base + α × residual`, in the normalized [−1, 1] action space. So the residual's σ = 1 corresponds to ±0.1. |
+| `init_logstd` | −1.0 | −1.0 | Initial log std of the Gaussian exploration noise: std = e⁻¹ ≈ 0.37, i.e. ≈ 0.037 after scaling by α. |
+| `learn_std` | `false` | — | Whether the log std is trained. With `false`, the noise stays fixed for the whole run. |
+| `action_head_std` | 0.0 | — | Init gain of the actor's last layer, which has no bias. With 0 the initial residual mean is exactly 0, so training starts from pure π_base. |
+| `actor_hidden_size` / `actor_num_layers` | 256 / 2 | — | Actor MLP. Its input is the normalized state (clamped to ±3) concatenated with the base action. |
+| `critic_hidden_size` / `critic_num_layers` | 256 / 2 | 256 / 2 | Critic MLP, same input. |
+| `actor_activation` / `critic_activation` | `ReLU` | ReLU (critic) | Hidden-layer activation. |
+| `critic_last_layer_bias_const` | 0.25 | 0.25 | Initial bias of the value output. |
+| `critic_last_layer_std` | 0.25 | — | Orthogonal-init gain of the value output layer. |
+| `pretrained_wts` | `null` | — | Path to a previous residual checkpoint to warm-start the residual's weights. Optimizers and schedules start fresh. |
+
+### 7.7 Optimization
+
+| Parameter | Default | Paper | What it does |
+|---|---|---|---|
+| `learning_rate_actor` | 3e-4 | 3e-4 | Peak LR for the actor (AdamW, eps 1e-5, weight decay 1e-6; eps and weight decay are hard-coded). |
+| `learning_rate_critic` | 5e-3 | 5e-3 | Peak LR for the critic. It's much higher than the actor's so the value function keeps up with a changing policy. |
+| `optimizer_betas_actor` | [0.9, 0.999] | — | Adam betas for the actor. The critic uses the PyTorch defaults. |
+| `lr_scheduler.name` | `cosine` | Cosine | Cosine decay over `num_iterations`. It steps once per **training** iteration. |
+| `lr_scheduler.actor_warmup_steps` | 5 | — | Linear warmup for the actor LR, in iterations. |
+| `lr_scheduler.critic_warmup_steps` | 0 | — | Warmup for the critic LR, in iterations. |
+| `update_epochs` | 50 | 50 | PPO epochs per iteration. With 1 minibatch, that's 50 gradient steps per iteration. |
+| `max_grad_norm` | 1.0 | 1.0 | Gradient norm clip on the residual policy. |
+
+### 7.8 PPO objective
+
+| Parameter | Default | Paper | What it does |
+|---|---|---|---|
+| `discount` | 0.999 | 0.999 | γ. Close to 1 because the only reward comes at the end of a ~500-step episode. |
+| `gae_lambda` | 0.95 | 0.95 | λ for Generalized Advantage Estimation. |
+| `norm_adv` | `true` | true | Normalize advantages to zero mean and unit std within each minibatch. |
+| `clip_coef` | 0.2 | 0.2 | PPO ratio clip ε. |
+| `clip_vloss` | `false` | — | Also clip the value-function update. Off. |
+| `vf_coef` | 1.0 | 1.0 | Weight of the value loss in the total loss. |
+| `ent_coef` | 0.0 | — | Entropy bonus. With `learn_std=false` the entropy is constant, so this has no effect unless `learn_std=true`. |
+| `target_kl` | 0.1 | 0.1 | Stop the epoch loop for this iteration once approx-KL exceeds this. `null` disables it. |
+| `n_iterations_train_only_value` | 0 | — | For the first N iterations, train only the critic (no policy loss). This warms up the value function. |
+| `residual_l1` / `residual_l2` | 0.0 / 0.0 | — | Optional L1 and L2 penalties on the residual mean, pushing corrections toward zero. Off. |
+| `base_bc.train_bc` | `false` | — | ⚠️ Not used by `residual_ppo.py`; it belongs to the `residual_ppo_w_bc.py` variant. |
+
+### 7.9 Reward
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `normalize_reward` | `true` | Divide each reward by a running std, without subtracting the mean, so 0 stays 0. A sparse +1 becomes ≈ 4–5 early in training. |
+| `clip_reward` | 5.0 | Clip the normalized reward to ±5. |
+
+### 7.10 Settings of the released residual checkpoints
+
+The configs saved in `checkpoints/rppo/one_leg/{low,med}/actor_chkpt.pt` differ from the defaults above on a few settings the paper doesn't list, plus one it does (init log std). To reproduce those runs instead of the paper tables, add:
+
+```bash
+actor.residual_policy.init_logstd=-0.9 actor.residual_policy.learn_std=true \
+ent_coef=0.001 normalize_reward=false
+```
+
+The med run also used `total_timesteps=1000000000`. See the Implementation Guide, Stage 2, for the side-by-side table.

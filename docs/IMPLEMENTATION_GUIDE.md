@@ -236,9 +236,7 @@ python -m src.train.residual_ppo base_policy.wt_path=<bc ckpt> \
   | `num_env_steps=700` | 700-step `one_leg` episodes | same |
 
   - Already matching (checked against the config): update epochs (50), mini-batches (1), actor/critic LR (3e-4 / 5e-3, cosine), value-loss coefficient (1.0), residual scale (0.1), initial log-std (−1), discount (0.999), GAE λ (0.95), clip ε (0.2), target KL (0.1), max grad norm (1.0), advantage normalization (on), critic (2×256, ReLU, last-layer bias 0.25).
-  - **Base-policy DDIM steps come from `<bc ckpt>`, not from this command.** The paper uses 4 (Table IV). `merge_base_bc_config_with_root_config` replaces `cfg.actor` with the checkpoint's actor config, so `actor.inference_steps=…` on this command line has no effect.
-    - A π_base you trained with the 1c command (`actor.inference_steps=4`) matches the paper.
-    - The released `checkpoints/bc/one_leg/{low,med}/actor_chkpt.pt` store **16**, so a residual trained on them runs the base with 16 steps. That is slower per step and differs from Table IV.
+  - **Base-policy DDIM steps are always 4**, matching Table IV. `residual_ppo.py` sets `agent.inference_steps = 4` after loading π_base, so the value stored in the BC checkpoint (16 in the released `checkpoints/bc/one_leg/{low,med}`) is ignored. `evaluate_model.py` does the same. `actor.inference_steps=…` on this command line has no effect either, because `merge_base_bc_config_with_root_config` replaces `cfg.actor` with the checkpoint's.
   - The paper's sim ran at about 4000 env steps/s across 1024 envs, so 500M steps is about 35 h of rollout at that speed, before PPO updates and evaluations. The one-step residual reached about 85% success in roughly 75M steps (App. "Effect of fully versus partially closed-loop policies"). You can stop once `best_success_rate` levels off.
 - **The released residual checkpoints were trained with different settings.** The configs saved in `checkpoints/rppo/one_leg/{low,med}/actor_chkpt.pt` differ from both the paper tables and the config defaults. The command above follows the paper. To reproduce the released runs instead, add the overrides in the last column.
 
@@ -248,8 +246,8 @@ python -m src.train.residual_ppo base_policy.wt_path=<bc ckpt> \
   | Learned log-std | not listed | `learn_std: false` | `actor.residual_policy.learn_std=true` |
   | Entropy coefficient | not listed | 0.0 | `ent_coef=0.001` |
   | Reward normalization | not listed | `normalize_reward: true` | `normalize_reward=false` |
-  | Env steps | 500M (Table VI) | 1B | low: 500M; med: `total_timesteps=1000000000` |
-  | Base DDIM steps | 4 (Table IV) | from `<bc ckpt>` | 16 (from the released BC checkpoints) |
+  | Env steps (budget) | 500M (Table VI) | 1B | low: 500M; med: `total_timesteps=1000000000` |
+  | Env steps when the best checkpoint was saved | — | — | low: 244 iterations ≈ 175M; med: 932 iterations ≈ 668M (scheduler `last_epoch` × 716,800; matches Figs. 26 and 27b) |
 - **Reads:** the π_base checkpoint, from exactly one of:
   - a local file: `base_policy.wt_path`;
   - a WandB run: `base_policy.wandb_id=<proj>/<id>`, with `base_policy.wt_type`.
