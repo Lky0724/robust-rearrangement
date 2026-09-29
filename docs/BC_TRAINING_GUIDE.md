@@ -264,9 +264,9 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 | Parameter | Value | What it does |
 |---|---|---|
 | `python -m src.train.bc` | — | Runs the BC trainer. Run it from the repo root; Hydra then switches into `outputs/<date>/<time>/`. |
-| `+experiment=state/diff_unet` | — | Experiment overlay: state observations, diffusion actor with the UNet backbone, batch 256, 1000 steps/epoch, rollouts on, `patience: inf`, wandb project `${task}-state-${randomness}`. The `+` is required because `experiment` isn't in the base defaults list. |
-| `task` | `one_leg` | Which task's demos to load (path component) and which env to roll out in. Also names the wandb project. |
-| `randomness` | `low` | Which demo folder to load (`…/teleop/low/…`) and the rollout env's initial-state randomization. |
+| `+experiment=state/diff_unet` | — | Experiment overlay: state observations, diffusion actor with the UNet backbone, batch 256, 1000 steps/epoch, rollouts on, `patience: inf`, wandb project `${task}-state-${randomness}`. The `+` is required because `experiment` isn't in the base defaults list. This is the parameter that picks the architecture; options are in the table below. |
+| `task` | `one_leg` | Which task's demos to load (path component) and which env to roll out in. Also names the wandb project. Options with released data and a sim env: `one_leg`, `lamp`, `round_table` (low and med), `mug_rack`, `factory_peg_hole` (low only). Other names in `src/common/tasks.py` (`square_table`, `desk`, `cabinet`, `chair`, `stool`, `drawer`, `place_shade`, `factory_nut_bolt`, `bimanual_insertion`) have no released data. |
+| `randomness` | `low` | Which demo folder to load (`…/teleop/low/…`) and the rollout env's initial-state randomization. Options: `low`, `med` (the paper's two levels) and `high` (env only; no released data). Data folders can also be `low_perturb` / `med_perturb` (demos with perturbations), but the env rejects those names, so when you load them set `rollout.randomness` to `low` or `med` explicitly. A list such as `'[med,med_perturb]'` loads several folders; set `rollout.randomness` explicitly then too. |
 | `training.num_epochs` | 400 | Number of 1000-step epochs → 400k gradient steps (paper: max 400k). Also the cosine-schedule length. Default 5000. |
 | `lr_scheduler.warmup_steps` | 500 | Linear LR warmup, in gradient steps. Paper: 500. Default 10,000. |
 | `actor.inference_steps` | 4 | DDIM denoising steps per plan, used in rollouts and action-sample metrics only (training always uses the 100-step DDPM noise schedule). Paper: 4. Default 16. |
@@ -274,13 +274,28 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 | `wandb.entity` | `<you>` | Required in practice: the experiment config sets `robust-assembly`, the authors' team, which your account can't log to. |
 | `dryrun` | `false` | `true` makes a debug run: 5 demos, 10 steps/epoch, no workers, wandb off, and evaluation + rollout after **every** epoch with no loss threshold. It doesn't lower `num_epochs`, so stop it by hand after one rollout. |
 
+Options for `+experiment` (overlays in `src/config/experiment/state/`):
+
+| Overlay | Paper name | Model | Chunk (predict / execute) | Notes |
+|---|---|---|---|---|
+| `state/diff_unet` | **DP** | Diffusion, 1D UNet, 66M | 32 / 8 | The paper's base policy for ResiP. |
+| `state/mlp_lg_ch` | **MLP-C** | Residual MLP, 5 blocks × 1024, ~11M (Table V) | 8 / 8 | Drop `actor.inference_steps=4` from the command: the key only exists for diffusion actors. |
+| `state/mlp_lg_si` | **MLP-S** | Same MLP | 1 / 1 | Replans every step. Same note as MLP-C. |
+| `state/mlp_sm_ch`, `state/mlp_sm_si` | — | Residual MLP, 1 block × 1024 | 8/8, 1/1 | Smaller MLP variants. Same note as MLP-C. |
+| `state/diff_tran` | — | Diffusion, transformer backbone | 32 / 8 | Also sets weight decay 1e-3 and warmup 1000. The paper used the transformer for its real-world image policies, not for state. |
+| `state/residual_diffusion` | — | Diffusion base + residual, trained with BC | 32 / 8 | Authors' experiment outside the paper pipeline (project `residual-diffusion-bc-1`, loads data at `med` + `med_perturb`). |
+| `state/scaling/<task>/…` | — | DP, batch 1024 | 32 / 8 | Demo-scaling runs (paper Figs. 1 and 6) on 1k–100k distilled rollouts via `data_paths_override`. Needs that rollout data. |
+| `state/mlp` | — | — | — | ⚠️ Legacy: doesn't build on `state/base`, uses the renamed `furniture` key. Use `mlp_lg_*` instead. |
+
+All `state/*` overlays log to the same wandb project (`${task}-state-${randomness}`), so add `wandb.name=<something>` to tell runs apart; the name is also the checkpoint folder. `actor/rnn.yaml` and `actor/act.yaml` exist, but `bc.py` can't build those actors ("Unknown actor type").
+
 ### 7.2 Data
 
 | Parameter | Default | Paper | What it does |
 |---|---|---|---|
 | `environment` | `sim` | — | Path component: `sim` or `real`. A list (e.g. `'[real,sim]'`) loads every existing combination. |
-| `demo_source` | `teleop` | — | Path component: `teleop` or `rollout`. |
-| `demo_outcome` | `success` | — | Path component: which outcome folder to load. |
+| `demo_source` | `teleop` | — | Path component. Options: `teleop` (human demos; the only released sim source), `rollout` (policy rollouts, e.g. Stage 3 output), `scripted`, `augmentation`. A list loads several. |
+| `demo_outcome` | `success` | — | Path component: which outcome folder to load. Options: `success`, `failure`, `partial_success`. Only folders that exist are loaded. |
 | `data.suffix` | `null` | — | Optional extra path component. |
 | `data.data_paths_override` | `null` | — | Explicit list of zarr paths, relative to `$DATA_DIR_PROCESSED/processed`, bypassing the path built from the fields above. |
 | `data.data_subset` | `null` | — | Load only the first N episodes. `dryrun` sets 5. |
@@ -299,17 +314,18 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 
 | Parameter | Default | Paper | What it does |
 |---|---|---|---|
-| `actor.name` | `diffusion` | — | Actor class: `diffusion`, `mlp`, `residual_diffusion`, `attentionpool_diffusion`. Selected by `experiment/state/diff_unet`. |
+| `actor.name` | `diffusion` | — | Actor class, set by the `+experiment` overlay (switch architectures there, not with this key). Options: `diffusion`, `mlp`, `residual_diffusion`, `attentionpool_diffusion` (image only). Anything else raises "Unknown actor type". |
+| `actor/diffusion_model` (config group) | `unet` | UNet (state) | Diffusion backbone. Override with a slash: `actor/diffusion_model=<name>`. Options: `unet` ([256, 512, 1024], 66M), `unet_big` ([512, 1024, 2048]), `transformer` (8 layers, 4 heads, 256-d), `transformer_big` (12 layers, 12 heads, 528-d). |
 | `actor.diffusion_model.down_dims` | [256, 512, 1024] | same | UNet channel widths per level. Sets model size (66M params). |
 | `actor.diffusion_model.diffusion_step_embed_dim` | 256 | 256 | Size of the noise-level (t) embedding. |
 | `actor.diffusion_model.kernel_size` | 5 | 5 | Conv1d kernel size along the 32-step time axis. |
 | `actor.diffusion_model.n_groups` | 8 | 8 | GroupNorm groups. |
 | `actor.num_diffusion_iters` | 100 | 100 | DDPM training noise steps (t ∈ 0..99). |
-| `actor.beta_schedule` | `squaredcos_cap_v2` | — | Noise schedule (cosine). |
-| `actor.prediction_type` | `epsilon` | — | The UNet predicts the added noise. |
+| `actor.beta_schedule` | `squaredcos_cap_v2` | — | Noise schedule. Options (diffusers): `squaredcos_cap_v2` (cosine), `linear`, `scaled_linear`, `sigmoid`. |
+| `actor.prediction_type` | `epsilon` | — | What the UNet predicts. Options (diffusers): `epsilon`, `sample`, `v_prediction`. ⚠️ Only `epsilon` works: `compute_loss` always regresses the added noise, so the other two would train one target and sample with another. |
 | `actor.clip_sample` | `true` | — | Clip denoised samples to [−1, 1] (the normalized action range). |
 | `actor.inference_steps` | 16 | 4 | See 7.1. The residual stage hard-codes 4 regardless. |
-| `actor.loss_fn` | `MSELoss` | — | `MSELoss` or `L1Loss` on the noise. |
+| `actor.loss_fn` | `MSELoss` | — | Loss on the noise (or on the actions, for MLPs). Any `torch.nn` loss class that accepts `reduction="none"`: `MSELoss`, `L1Loss`, `SmoothL1Loss`, `HuberLoss`. |
 | `actor.include_proprioceptive_pos` / `_ori` | `true` / `true` | — | `false` zeros the EE position (dims 0–2) / 6D rotation (dims 3–8) in the observation. Ablation only. |
 | `actor.projection_dim`, `actor.confusion_loss_*`, `actor.rescale_loss_for_domain` | — | — | ⚠️ Image / co-training options; no effect for state. |
 
@@ -322,7 +338,7 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 | `training.num_epochs` | 5000 | 400k steps | See 7.1. |
 | `training.actor_lr` | 1e-4 | 1e-4 | Peak LR (AdamW). |
 | `regularization.weight_decay` | 1e-6 | 1e-6 | AdamW weight decay. |
-| `lr_scheduler.name` | `cosine` | Cosine | Schedule over `steps_per_epoch × num_epochs` steps, stepped every batch. |
+| `lr_scheduler.name` | `cosine` | Cosine | Schedule over `steps_per_epoch × num_epochs` steps, stepped every batch. Options (diffusers 0.26): `cosine`, `linear`, `cosine_with_restarts` (one cycle with the defaults `bc.py` passes, so like `cosine`), `polynomial` (power 1, so like `linear`), `constant_with_warmup`, `constant` (ignores `warmup_steps`). `piecewise_constant` fails: it needs step rules that `bc.py` doesn't pass. |
 | `lr_scheduler.warmup_steps` | 10,000 | 500 | See 7.1. |
 | `training.clip_grad_norm` | `false` | — | Sets the clip threshold as `1 + 1000 × (1 − clip_grad_norm)`: `true` → clip at 1.0, `false` → 1001, i.e. effectively no clipping. The norm is logged either way. |
 | `training.ema.use` / `.decay` / `.switch` | `false` / 0.999 / `false` | — | EMA of the weights, used for validation and rollouts. `switch=true` copies the EMA weights into the model every epoch. See §5 for the checkpoint caveat. |
@@ -343,7 +359,7 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 | `rollout.num_envs` | 256 | Parallel IsaacGym envs per rollout round. Lower it (e.g. 64) if GPU memory is tight. |
 | `rollout.count` | `${rollout.num_envs}` | Total rollouts per evaluation; runs `count // num_envs` rounds. |
 | `rollout.max_steps` | 1000 | See 7.1. |
-| `rollout.task` / `rollout.randomness` | `${task}` / `${randomness}` | Env to evaluate in. Can differ from the training data, e.g. evaluate a low-data policy at `med`. |
+| `rollout.task` / `rollout.randomness` | `${task}` / `${randomness}` | Env to evaluate in. Can differ from the training data, e.g. evaluate a low-data policy at `med`. Options: the task names under `task` (7.1); randomness `low`, `med`, `high` (single value only, no `_perturb` names or lists). |
 | `rollout.save_rollouts` / `rollout.save_failures` | `false` / `false` | Write rollouts as raw pickles under `$DATA_DIR_RAW/raw/diffik/sim/<task>/rollout/<randomness>/`. `save_failures` also keeps failed ones. |
 | `rollout.parts_poses_in_robot_frame` | `false` | Express part poses in the robot frame in the env. Must match how the training data was processed. |
 | `rollout.n_parts_assemble` | `null` | ⚠️ Not passed through by `bc.py`; the env's own value is used (1 for `one_leg`). |

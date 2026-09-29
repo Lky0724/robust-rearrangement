@@ -390,7 +390,7 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 | Robot state | Nested dict incl. joint data | 16-D vector with rot6d; joint data dropped |
 | Rotation | Quaternion (xyzw) | 6D rotation |
 | Action | 8-D delta | 10-D absolute (`action/pos` = state + delta) and 10-D delta |
-| Action clipping | – | Per-step Δpos clipped to ±2.5 cm, Δrot magnitude to 0.35; gripper → sign |
+| Action clipping | – | Δpos clipped per axis to ±2.5 cm; Δrot scaled down per *episode* (a bug, see §10); gripper → sign |
 | Images | Any size | 240×320 (wrist resized; front resized and cropped) |
 | Length | T+1 observations (sim) | Last observation dropped so it lines up with T actions |
 
@@ -450,41 +450,88 @@ The data enters RL only through π_base's normalizer. π_res reuses it, while π
 
 ## 9. Visualizing data and evaluating checkpoints
 
-These tools cover checking data quality (videos, open-loop replay in the simulator, plots) and checking model performance (success rate, a live viewer, recorded rollouts). All of them run on a single workstation GPU; this machine has an RTX 3000 Ada (8 GB) and a display (`DISPLAY=:1`) for the IsaacGym viewer.
+### 9.1 Which tool for which data
 
-### 9.1 Inspecting data
+Both raw (`.pkl`) and processed (`.zarr`) data can be viewed **as recorded** (the stored camera images and trajectories) or **re-simulated** (the recorded actions played again in IsaacGym, watched live or re-rendered to video).
 
-**Zarr episode → video.** `create_mp4` in [src/visualization/render_mp4.py](src/visualization/render_mp4.py) writes frames with imageio and ffmpeg. Tested on `one_leg/teleop/low`, episode 0: 401 frames, wrist | front side by side.
+| | As recorded: videos and plots | Re-simulated in IsaacGym |
+|---|---|---|
+| **Raw `.pkl`** (one file or a folder) | [scripts/visualize_data.py](../scripts/visualize_data.py) (§9.2) | [scripts/replay_in_sim.py](../scripts/replay_in_sim.py), exact start state (§9.3) |
+| **Processed `.zarr`** | [scripts/visualize_data.py](../scripts/visualize_data.py) (§9.2) | [scripts/replay_in_sim.py](../scripts/replay_in_sim.py), approximate start state (§9.3) |
 
-```python
-import zarr, numpy as np
-from src.visualization.render_mp4 import create_mp4
+Use the recorded view to check what was captured (image content, camera framing, action/state consistency, coverage). Use the re-simulated view when there are no images (state-only rollouts), or to check that the recorded actions still move the robot the same way.
 
-z = zarr.open("data/processed/diffik/sim/one_leg/teleop/low/success.zarr", "r")
-ends = z["episode_ends"][:]
-i = 0
-s, e = (0 if i == 0 else ends[i - 1]), ends[i]
-frames = np.concatenate([z["color_image1"][s:e], z["color_image2"][s:e]], axis=2)  # wrist | front
-create_mp4(frames, f"ep{i}.mp4", fps=30)
+**Setup.** Run both scripts with the `resip` env's Python from the repo root. The simulator tools also need the env's `lib/` on the library path; without it IsaacGym fails with `libpython3.8.so.1.0: cannot open shared object file`:
+```bash
+conda activate resip
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
 
-- **Raw pickle → video:** `mp4_from_pickle(path, "out.mp4")` from the same file.
-- **Every episode of several zarrs:** [notebooks/visualize_demos.py](notebooks/visualize_demos.py). It hard-codes the authors' cluster `DATA_DIR_PROCESSED`, so edit that first.
-- **State-only rollouts** have 2×2 placeholder images, so their videos are blank. Replay them in the simulator instead.
-
-**Replay a raw pickle in the simulator** with [run_sim_env.py](furniture-bench/furniture_bench/scripts/run_sim_env.py):
+### 9.2 Recorded data: videos and plots
 
 ```bash
-python -m furniture_bench.scripts.run_sim_env --furniture one_leg --randomness low \
-    --replay-path <episode>.pkl     # reset to the pickle's first observation, then replay its actions
-#   --record    save a video      --headless    no viewer
+python scripts/visualize_data.py info  <data>                      # metadata, episode stats, sanity checks
+python scripts/visualize_data.py video <data> --episodes 0 5 12    # wrist | front mp4 per episode
+python scripts/visualize_data.py plot  <data> --episodes 0         # per-episode time series + dataset overview
+#   <data> = a .zarr, a .pkl/.pkl.gz/.pkl.xz, or a folder of pickles (e.g. raw/.../success/)
+#   --out-dir DIR (default ./viz)   --fps N (default 30; data is 10 Hz)   --max-files N (pickle folders)
 ```
 
-- **Open-loop check.** Replay runs the recorded actions without feedback. If it still assembles, the actions are physically consistent. If it drifts, suspect action clipping (§5), a controller mismatch or noisy data.
-- **Needs a raw pickle.** The pickle's actions are 8-D deltas with quaternions, which is the script's default rotation format (`--act-rot-repr quat`). `--file-path` also replays actions but skips the reset, so parts start at random poses; prefer `--replay-path`.
-- **What can be replayed.** S3 has no raw pickles for the `one_leg` sim teleop demos (§2.1). Rollout, `coverage/`, `distill/` and real pickles can be replayed.
+| Command | Output |
+|---|---|
+| `info` | Metadata (zarr `.zattrs` or pickle count), array shapes, episode lengths, success count. Checks for NaNs, gripper actions other than ±1, and the gap between commanded and actual position |
+| `video` | `<name>_ep###.mp4`: wrist and front cameras side by side, with step, gripper command and gripper width drawn on each frame. Zarrs only decompress the chunks of the requested episodes |
+| `plot` | `<name>_ep###_timeseries.png`: EE x/y/z against the commanded target, gripper width against the open/close command. `<name>_overview.png`: EE paths (top-down and side), initial part positions, episode-length histogram |
 
-**Notebooks** ([notebooks/](notebooks/)). Most hard-code the authors' paths, so edit those before running.
+- **Both formats are treated the same.** A pickle's 8-D delta actions are turned into absolute position targets (EE position + delta), as `process_pickles.py` does, so the plots are directly comparable with zarr plots. A folder of pickles is loaded as a dataset, one episode per file in sorted order.
+- **State-only rollouts** (all of `coverage/` and `distill/`, and any rollout saved with `--observation-space state`) have 2×2 placeholder images. `video` reports this instead of writing blank files; use `plot` or §9.3 for those.
+- **Pickle size.** Pickles with images are large (68 MB for a 146-step `factory_peg_hole` demo, up to ~1 GB for real demos) and load fully into memory; use `--max-files` on folders.
+
+Tested on `one_leg/teleop/low` (zarr, 50 episodes), a state-only `one_leg` RL rollout pickle and a `factory_peg_hole` teleop pickle with images.
+
+### 9.3 Re-simulating an episode in IsaacGym
+
+```bash
+python scripts/replay_in_sim.py <episode.pkl>              --record replay.mp4   # raw pickle
+python scripts/replay_in_sim.py <success.zarr> --episode 3 --record replay.mp4   # processed zarr
+#   --viewer         open the IsaacGym viewer window (needs a display)
+#   --record FILE    save the simulated wrist | front cameras to mp4
+#   --hold-steps N   repeat the last action N extra steps (default 20)
+```
+
+The script prints how closely the simulated end effector follows the recording, and whether the task reward fired:
+```
+Replayed 505 steps (+20 hold) of rollout.pkl (one_leg)
+  EE tracking vs. recording: mean 0.07 cm, max 1.01 cm, final 0.00 cm
+  Reward collected: 1  (assembled ✓)
+```
+
+**How the start state is restored**
+
+| Input | Start state | Actions replayed |
+|---|---|---|
+| `.pkl` | **Exact.** Robot joint angles and part poses from the first observation (`env.reset_to`) | Absolute targets built from the recorded EE pose + each delta |
+| `.zarr` | **Approximate.** Zarrs don't store joint angles, so the arm is reset to its default joints and driven to the recorded start EE pose (`--settle-steps`, default 40). Only then are the parts placed at their recorded start poses | `action/pos` for position and gripper. Orientation targets come from the next recorded state (`--zarr-rotation state`, default), because the stored action rotations are scaled down by a processing bug (§10) |
+
+Variant task names such as `one_leg_full` use the base task's environment; `--task` overrides it.
+
+**What replay can and can't tell you.** Replay runs the recorded actions without feedback, so the robot's motion is reproduced closely but contacts can play out differently.
+
+| Test episode | EE tracking (mean / max) | Reward fired? |
+|---|---|---|
+| `one_leg` RL rollout pickle (recorded in the same RL env) | 0.07 / 1.01 cm | ✓ |
+| `factory_peg_hole` teleop pickle | 0.01 / 0.25 cm | ✗: the peg stayed in the gripper instead of being released in the hole |
+| `one_leg/teleop/low` zarr, episodes 0–3 | 0.04–0.14 / 0.6–1.8 cm | 1 of 4 |
+
+- **Good for** watching any episode, including state-only rollouts, from both cameras; checking that recorded actions are physically consistent (large tracking errors point to bad data or a controller mismatch); and comparing replays side by side with the recorded video.
+- **Not a pass/fail test for teleop data.** Teleop demos were recorded in the teleop environment (`FurnitureSimEnv`), while replay uses the RL environment. Small contact differences at grasps and insertions can prevent the reward from firing even when the motion matches. Replays of RL rollouts, recorded in the same environment, did reproduce success.
+- **Replaying deltas drifts.** Applying the pickle's delta actions to the *simulated* pose (as the upstream `run_sim_env --replay-path` does) compounds errors: 2.5 cm mean drift on the RL rollout above, against 0.07 cm with absolute targets.
+
+The upstream alternative is `python -m furniture_bench.scripts.run_sim_env --furniture one_leg --randomness low --replay-path <episode>.pkl [--record] [--headless]` ([run_sim_env.py](../furniture-bench/furniture_bench/scripts/run_sim_env.py)). It resets to the pickle's first observation in the teleop environment and replays the deltas. It has not been run on this machine.
+
+### 9.4 Notebooks
+
+The [notebooks/](../notebooks/) folder has more specialized views. Most hard-code the authors' data paths, so edit those before running.
 
 | Notebook | Shows |
 |---|---|
@@ -498,10 +545,11 @@ python -m furniture_bench.scripts.run_sim_env --furniture one_leg --randomness l
 | `16_la_visualize_encoder_features` | Vision encoder features |
 | `04_la_real_world_demos`, `07_*align_inspect_cameras` | Real demos; sim/real camera alignment |
 | `11_as_bc_fail_rl_succ` | Episodes where BC fails and ResiP succeeds |
+| [visualize_demos.py](../notebooks/visualize_demos.py) | Every episode of several zarrs to mp4 (front camera only) |
 
-### 9.2 Evaluating checkpoints
+### 9.5 Evaluating checkpoints
 
-[src/eval/evaluate_model.py](src/eval/evaluate_model.py) loads a WandB run (`--run-id`) or a local file (`--wt-path`, through `LocalCheckpointWrapper` in [eval_utils.py](src/eval/eval_utils.py)), rolls it out in `--n-envs` parallel simulator copies and prints the success rate.
+[src/eval/evaluate_model.py](../src/eval/evaluate_model.py) loads a WandB run (`--run-id`) or a local file (`--wt-path`, through `LocalCheckpointWrapper` in [eval_utils.py](../src/eval/eval_utils.py)), rolls it out in `--n-envs` parallel simulator copies and prints the success rate.
 
 ```bash
 # 1. Success rate. Compare with paper Table I (one_leg low: DP 54%, ResiP 98%; med: 26% / 76%)
@@ -512,11 +560,12 @@ python -m src.eval.evaluate_model --wt-path checkpoints/rppo/one_leg/low/actor_c
 # 2. Watch live in the IsaacGym viewer: same command with few envs
     ... --n-envs 4 --n-rollouts 4 --visualize
 
-# 3. Record videos: render cameras, save every episode as a pickle, then mp4_from_pickle on each
+# 3. Record episodes with camera images, then view them with §9.2
     ... --observation-space image --save-rollouts --save-failures --save-rollouts-suffix eval_vid
+python scripts/visualize_data.py video $DATA_DIR_RAW/raw/diffik/sim/one_leg/rollout/low/eval_vid/failure --episodes 0 1 2
 ```
 
-- **Recording (3)** is the flag set the authors used to record BC-vs-RL videos ([9_ol_bc_vs_rppo_pert.sh](scripts/ant_local/rollout_for_render/9_ol_bc_vs_rppo_pert.sh)). With `--observation-space image` the simulator renders both cameras, so saved pickles contain real images; a state policy still works because the observations still include `parts_poses`.
+- **Recording (3)** is the flag set the authors used to record BC-vs-RL videos ([9_ol_bc_vs_rppo_pert.sh](../scripts/ant_local/rollout_for_render/9_ol_bc_vs_rppo_pert.sh)). With `--observation-space image` the simulator renders both cameras, so saved pickles contain real images; a state policy still works because the observations still include `parts_poses`. Rollouts saved with `--observation-space state` can be re-rendered with §9.3 instead.
 - **Save location.** Episodes go to `$DATA_DIR_RAW/raw/diffik/sim/<task>/rollout/<randomness>/eval_vid/{success,failure}/`. The failures show fastest how a policy fails.
 - **Other useful flags:**
 
@@ -528,12 +577,12 @@ python -m src.eval.evaluate_model --wt-path checkpoints/rppo/one_leg/low/actor_c
 | `--break-on-n-success --stop-after-n-success N` | Stop after N successes (used to generate expert data) |
 | `--compress-pickles` | Save as `.pkl.xz` |
 
-- **During training.** [bc.py](src/train/bc.py) runs simulator rollouts every `training.eval_every` epochs, and [residual_ppo.py](src/train/residual_ppo.py) evaluates every 5th iteration. Both log success rates (and videos where enabled) to WandB, so those curves are the main check while training.
+- **During training.** [bc.py](../src/train/bc.py) runs simulator rollouts every `training.eval_every` epochs, and [residual_ppo.py](../src/train/residual_ppo.py) evaluates every 5th iteration. Both log success rates (and videos where enabled) to WandB, so those curves are the main check while training.
 
 **Before running on this machine:**
-- **Download checkpoints first:** `checkpoints/{bc,rppo}/one_leg/{low,med}/actor_chkpt.pt` (§8). None are local yet.
+- **Checkpoints.** The four `one_leg` checkpoints are in `./checkpoints/`; get others with `scripts/download_checkpoints.py` (§8).
 - **8 GB GPU.** Use `--n-envs` of about 16–64 instead of the paper's 1024. Image-mode rollouts are slower and use more memory.
-- **Status.** Only the zarr→video path has been tested here. `--wt-path` evaluation of the released checkpoints and `run_sim_env --replay-path` haven't been run on this machine yet.
+- **Status.** `evaluate_model --wt-path` on the released checkpoints hasn't been run on this machine yet.
 - **meshcat** isn't installed in the `resip` env; only the real-robot scripts need it.
 
 ---
@@ -543,7 +592,7 @@ python -m src.eval.evaluate_model --wt-path checkpoints/rppo/one_leg/low/actor_c
 1. **Rendered data is filed under a domain the loader never searches.** On S3 it lives in `processed/diffik/sim2real/…`, but training globs only `processed/<controller>/<environment>/…` with `environment ∈ {sim, real}`. Copy the zarrs into `sim/<task>/…`, or list them with `data.data_paths_override`.
 2. **Task names in IMPLEMENTATION_GUIDE.md don't exist on S3.** Stage 5 of IMPLEMENTATION_GUIDE.md uses `one_leg_real` and `one_leg_render_rppo`; on S3 they are `one_leg_full` / `one_leg_full_new` and `one_leg_render_rppo_{1,black,brighter}`. Also use `task=`, not the outdated `furniture=` key.
 3. **`reward`, `skill` and `augment_states` in zarrs aren't meaningful.** In the `one_leg` teleop zarrs, `reward` is all zeros plus one stray NaN per episode, and the other two are all zeros. `StateDataset` builds its own reward (1 at each episode end) when it needs one. RL rewards come from the simulator.
-4. **Processing clips actions.** Harmless for teleop, but check how often it triggers on policy rollouts.
-5. **State-only rollouts have 2×2 placeholder images.** Don't train an image policy on `sim/*/rollout` zarrs; use the `sim2real` renders.
+4. **Processing scales down every episode's rotation actions.** `clip_quat_xyzw_magnitude` ([utils.py:103](../src/data_processing/utils.py#L103)) computes one norm over the *whole* (T, 4) array it is given, and `process_pickles.py` passes a whole episode. So whenever an episode's rotations add up to more than 0.35 rad, every rotation step in it is shrunk by the same factor. In all three released `one_leg` teleop zarrs, every episode's combined rotation is exactly 0.35 rad and no single step exceeds 2.1°. The recorded *states* are unaffected; only `action/pos` and `action/delta` orientations are. The code has behaved this way since April 2024 (commit `b534d7a`), so the released checkpoints were most likely trained on data like this; that isn't verified. If you reprocess data, clip per step instead (e.g. `np.linalg.norm(delta_rotvec, axis=-1, keepdims=True)`). The position clip (each axis to ±2.5 cm) is applied per element and is fine.
+5. **State-only rollouts have 2×2 placeholder images.** This covers everything in `coverage/` and `distill/`, and any rollout saved with `--observation-space state`. Some processed rollout zarrs do have real IsaacGym images (e.g. `rppo_low_*`, `bc_low_*`). Check with `scripts/visualize_data.py info` before training an image policy.
 6. **Real teleop marks every saved demo as a success.** Filter bad demos yourself before processing.
 7. **Watch the size of large zarrs.** By default (`data.load_into_memory=true`, [bc.py:202](src/train/bc.py#L202)), `ImageDataset` copies all images into RAM, so a 30 GB render needs about that much memory. Set `data.load_into_memory=false` to keep images on disk and read them from the zarr per sample.
