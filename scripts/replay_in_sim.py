@@ -23,6 +23,7 @@ itself a data-quality signal. Per-step EE tracking error against the recording i
 """
 
 import argparse
+import random
 from pathlib import Path
 
 import furniture_bench  # noqa: F401  (imports isaacgym, which must come before torch)
@@ -121,7 +122,12 @@ def main():
                         help="zarr + state rotation: aim at the recorded orientation this many steps ahead")
     parser.add_argument("--hold-steps", type=int, default=20, help="Repeat the last action this many extra steps")
     parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0, help="Seed for torch/numpy/random")
     args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     ep = load_episode(args.path, args.episode, args.zarr_rotation, args.rotation_lead)
     task = args.task or ep["task"]
@@ -147,6 +153,12 @@ def main():
     device = env.device
     frames = []
 
+    # The start state is overwritten below, so switch off the env's reset randomization: arm joint
+    # noise (a 7-DoF arm reaches the same EE pose with different elbow positions) and the random
+    # pushes on the parts, which leave them moving.
+    env.franka_joint_rand_lim_deg = 0.0
+    env.max_force_magnitude = 0.0
+    env.max_torque_magnitude = 0.0
     obs = env.reset()
 
     if ep["kind"] == "pkl":
@@ -161,7 +173,8 @@ def main():
         target_t = torch.tensor(target, device=device)[None]
         for _ in range(args.settle_steps):
             obs, *_ = env.step(target_t)
-        # 2. Place the parts at their recorded start poses (AprilTag frame, as stored)
+        # 2. Place the parts at their recorded start poses (AprilTag frame, as stored), at rest
+        env.root_tensor.view(env.num_envs, -1, 13)[..., 7:13] = 0.0
         env._reset_parts(0, ep["start_parts"])
         env.refresh()
         reached = env.get_ee_pose()[0][0].cpu().numpy()

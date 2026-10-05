@@ -221,8 +221,8 @@ class DataCollectorSpaceMouse:
         args.command_latency = 0.01
         args.deadzone = 0.05
         if self.env.ctrl_mode == "diffik":
-            args.max_pos_speed = 0.3  # 0.8
-            args.max_rot_speed = 0.7  # 3.0
+            args.max_pos_speed = 0.15  # 0.8
+            args.max_rot_speed = 0.3  # 3.0
         else:
             args.max_pos_speed = 0.8
             # args.max_rot_speed = 2.5
@@ -288,7 +288,7 @@ class DataCollectorSpaceMouse:
         steps_since_grasp = 0
 
         with SharedMemoryManager() as shm_manager:
-            with Spacemouse(shm_manager=shm_manager, deadzone=args.deadzone) as sm:
+            with Spacemouse(shm_manager=shm_manager, deadzone=(0.05, 0.05, 0.05, 0.3, 0.05, 0.3)) as sm:
                 t_start = time.monotonic()
 
                 prev_keyboard_gripper = -1

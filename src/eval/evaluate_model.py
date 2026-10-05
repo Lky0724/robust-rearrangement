@@ -399,7 +399,13 @@ if __name__ == "__main__":
                     actor.inference_steps = 4
 
                 if args.wt_path:
-                    actor.load_state_dict(run.checkpoint["model_state_dict"])
+                    state_dict = run.checkpoint
+                    # Older checkpoints are a flat state dict with the config stored alongside
+                    if "model_state_dict" in state_dict:
+                        state_dict = state_dict["model_state_dict"]
+                    else:
+                        state_dict = {k: v for k, v in state_dict.items() if k != "config"}
+                    actor.load_state_dict(state_dict)
                     actor.eval()
                     actor.to(device)
 

@@ -193,14 +193,18 @@ The task level is a label: only the base task corresponds to a simulator environ
 
 #### Randomness levels
 
-Part placement comes from `FurnitureSimEnv` ([furniture_sim_env.py:1349](furniture-bench/furniture_bench/envs/furniture_sim_env.py#L1349)). Fixture offset, force perturbations and joint noise come from `FurnitureRLSimEnv` ([furniture_rl_sim_env.py:1692](furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1692)), the environment used for RL and evaluation.
+The same level name means different things in the two simulator environments:
+- **RL env** (`FurnitureRLSimEnv`, [furniture_rl_sim_env.py:1692](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1692)) puts the parts at their nominal poses and pushes each one with a random horizontal force and twist at reset. It also offsets the fixture and adds noise to the arm's starting joints. It is used for **RL training, evaluation, rollouts and SpaceMouse demo collection**: [data_collector_sm.py](../src/data_collection/data_collector_sm.py) has created this env since 2024-05-15, and the released `one_leg` teleop demos were recorded on 2024-05-16 to 05-28, so they very likely share evaluation's initial-state distribution.
+- **Original FurnitureBench env** (`FurnitureSimEnv`, [furniture_sim_env.py:1349](../furniture-bench/furniture_bench/envs/furniture_sim_env.py#L1349)) places each part uniformly at random around its nominal pose. It is used by `furniture_bench.scripts.run_sim_env` and the older scripted collector ([data_collector.py](../src/data_collection/data_collector.py)).
 
-| Level | Part position | Part yaw | Fixture offset | Max perturbation force / torque | Initial joint noise | In the paper |
-|---|---|---|---|---|---|---|
-| `low` | ±1.5 cm | ±15° | ±2 cm | 0.2 / 0.007 | ±5° | Yes |
-| `med` | ±5 cm | ±45° | ±4 cm | 0.5 / 0.01 | ±10° | Yes |
-| `high` | Predefined high-randomness poses | – | ±6 cm | 0.75 / 0.015 | ±13° | No |
-| `<level>_perturb` | as `<level>` | | | | | – |
+| Level | Original env: part position / yaw | RL env: fixture offset | RL env: max push force / torque | RL env: joint noise | In the paper |
+|---|---|---|---|---|---|
+| `low` | ±1.5 cm / ±15° | ±2 cm | 0.2 / 0.007 | ±5° | Yes |
+| `med` | ±5 cm / ±45° | ±4 cm | 0.5 / 0.01 | ±10° | Yes |
+| `high` | Predefined high-randomness poses | ±6 cm | 0.75 / 0.015 | ±13° | No |
+| `<level>_perturb` | as `<level>`, plus random pushes during the demo | – | – | – | – |
+
+Push forces are scaled per part (for `one_leg`, ×25 for the heavier tabletop, ×1 for the legs), so the resulting displacement has no fixed range. The paper describes the ranges as ±1.5 cm (low) and ±5 cm (med), with fixture offsets of ±2 / ±4 cm (§III-C).
 
 `_perturb` folders hold teleop demos collected with `--sample-perturbations`: random forces are applied to parts while the operator acts ([teleop.py:81](src/data_collection/teleop.py#L81), [data_collector_sm.py:483](src/data_collection/data_collector_sm.py#L483)). On S3 the level only appears as `sim2real/one_leg_render_demos_*/teleop/med_perturb`. The `state/scaling/one_leg/low/*` configs also reference `sim/one_leg/teleop/low_perturb`, which isn't in the bucket.
 
@@ -355,7 +359,7 @@ Readers decompress only the chunks a slice touches. If a single chunk file is mi
 | `action/delta` | (N, 10) float32 | The same action as a delta, in rot6d |
 | `color_image1` | (N, 240, 320, 3) uint8 | Wrist camera |
 | `color_image2` | (N, 240, 320, 3) uint8 | Front camera (resized and cropped) |
-| `reward`, `skill`, `augment_states` | (N,) | Effectively unused (see §10) |
+| `reward`, `skill`, `augment_states` | (N,) | `reward` marks the step where the simulator detected assembly during teleop (1 or NaN, see §10.5); the other two are all zeros |
 | `episode_ends` | (E,) uint32 | Cumulative end index: episode *i* is rows `[ends[i-1], ends[i])` |
 | `success`, `task`, `pickle_file` | (E,) | Per-episode flag, task name, source pickle path |
 
@@ -390,7 +394,7 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 | Robot state | Nested dict incl. joint data | 16-D vector with rot6d; joint data dropped |
 | Rotation | Quaternion (xyzw) | 6D rotation |
 | Action | 8-D delta | 10-D absolute (`action/pos` = state + delta) and 10-D delta |
-| Action clipping | – | Δpos clipped per axis to ±2.5 cm; Δrot scaled down per *episode* (a bug, see §10); gripper → sign |
+| Action clipping | – | Δpos clipped per axis to ±2.5 cm; Δrot scaled down per *episode* (a bug, see §11); gripper → sign |
 | Images | Any size | 240×320 (wrist resized; front resized and cropped) |
 | Length | T+1 observations (sim) | Last observation dropped so it lines up with T actions |
 
@@ -434,7 +438,7 @@ The data enters RL only through π_base's normalizer. π_res reuses it, while π
 
 - **Teleop demos only:** `python scripts/download_data.py --task one_leg`. This fetches `processed/diffik/sim/<task>/teleop/` (low, med and, for `one_leg`, high) into `$DATA_DIR_PROCESSED/processed/…`.
 - **Checkpoints:** `python scripts/download_checkpoints.py` fetches `checkpoints/{bc,rppo}/one_leg/{low,med}/actor_chkpt.pt` (1.6 GB) into `./checkpoints/…`. Narrow it with `--task`, `--kind` and `--randomness`, get all 16 with `--task all`, and preview with `--dry-run`. Files already present with the right size are skipped.
-- **Anything else:** use the AWS CLI without credentials. Put `sim2real` zarrs under `sim/` so the co-training config can find them (§10, item 1):
+- **Anything else:** use the AWS CLI without credentials. Put `sim2real` zarrs under `sim/` so the co-training config can find them (§11, item 1):
   ```bash
   B=s3://iai-robust-rearrangement
   D=$DATA_DIR_PROCESSED/processed/diffik
@@ -473,9 +477,18 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 python scripts/visualize_data.py info  <data>                      # metadata, episode stats, sanity checks
 python scripts/visualize_data.py video <data> --episodes 0 5 12    # wrist | front mp4 per episode
 python scripts/visualize_data.py plot  <data> --episodes 0         # per-episode time series + dataset overview
-#   <data> = a .zarr, a .pkl/.pkl.gz/.pkl.xz, or a folder of pickles (e.g. raw/.../success/)
-#   --out-dir DIR (default ./viz)   --fps N (default 30; data is 10 Hz)   --max-files N (pickle folders)
 ```
+
+**Parameters** (`python scripts/visualize_data.py <command> <data> [options]`)
+
+| Parameter | Default | Applies to | Meaning |
+|---|---|---|---|
+| `command` | required | – | `info`, `video` or `plot` (see the next table) |
+| `data` | required | all | What to load: a `.zarr` directory, a single `.pkl` / `.pkl.gz` / `.pkl.xz`, or a folder of pickles (e.g. `raw/.../success/`). A folder is treated as a dataset with one episode per file, in sorted file-name order |
+| `--episodes N [N ...]` | `0` | `video`, `plot` | Episode indices to render. For a zarr, the index into `episode_ends`; for a pickle folder, the file's position in sorted order; for a single pickle, only `0` exists. `plot` always draws the overview from **all** loaded episodes; this only picks the time-series figures |
+| `--max-files N` | all | pickle folders | Load at most the first N pickles. Pickles load fully into memory, so use this on large folders |
+| `--fps N` | `30` | `video` | Playback frame rate. The data is recorded at 10 Hz, so 30 plays at 3× speed and 10 plays in real time |
+| `--out-dir DIR` | `viz` | `video`, `plot` | Output folder, created if missing. Files are named after the dataset: the randomness folder for `…/<level>/success.zarr` (e.g. `low_ep003.mp4`), otherwise the file or folder name |
 
 | Command | Output |
 |---|---|
@@ -494,10 +507,27 @@ Tested on `one_leg/teleop/low` (zarr, 50 episodes), a state-only `one_leg` RL ro
 ```bash
 python scripts/replay_in_sim.py <episode.pkl>              --record replay.mp4   # raw pickle
 python scripts/replay_in_sim.py <success.zarr> --episode 3 --record replay.mp4   # processed zarr
-#   --viewer         open the IsaacGym viewer window (needs a display)
-#   --record FILE    save the simulated wrist | front cameras to mp4
-#   --hold-steps N   repeat the last action N extra steps (default 20)
+python scripts/replay_in_sim.py <success.zarr> --episode 3 --viewer              # watch live
 ```
+
+**Parameters** (`python scripts/replay_in_sim.py <path> [options]`)
+
+| Parameter | Default | Applies to | Meaning |
+|---|---|---|---|
+| `path` | required | all | A raw `.pkl` episode (`.pkl.gz` / `.pkl.xz` also work) or a processed `.zarr` directory. A folder of pickles isn't accepted; pass one file |
+| `--episode N` | `0` | zarr | Which episode of the zarr to replay (index into `episode_ends`) |
+| `--task NAME` | from the data | all | Simulator task to load. By default it is read from the zarr's `task` array or the pickle's `task`/`furniture` key. Variant labels are mapped to their base task by prefix (`one_leg_full` → `one_leg`). Valid base tasks: `one_leg`, `round_table`, `lamp`, `mug_rack`, `factory_peg_hole` |
+| `--viewer` | off | all | Open the IsaacGym viewer window and play the replay live. Needs a display; runs headless without it |
+| `--record FILE` | off | all | Render both simulated cameras and save them side by side (wrist \| front, 240 px high) to this mp4. Turns on camera rendering, which slows the replay |
+| `--fps N` | `30` | `--record` | Frame rate of the recorded mp4 (the simulation steps at 10 Hz) |
+| `--settle-steps N` | `40` | zarr | Steps used to drive the arm from its default joints to the recorded start pose before the parts are placed. The start error is printed (`Start pose reached within … cm`); raise this if it isn't close to 0 |
+| `--zarr-rotation state\|action` | `state` | zarr | Where orientation targets come from. `state`: the recorded orientation `--rotation-lead` steps ahead, which reproduces the real motion. `action`: `action/pos` as stored, which is under-rotated by the processing bug (§11) and useful only to show its effect |
+| `--rotation-lead N` | `1` | zarr, `state` | How many steps ahead the orientation target looks. The controller lags its target by about a step; 2 made no consistent difference in tests |
+| `--hold-steps N` | `20` | all | Extra steps that repeat the final action, so the controller can settle and a final insertion or screw can register. Not counted in the tracking error |
+| `--gpu N` | `0` | all | CUDA device for the simulation and rendering |
+| `--seed N` | `0` | all | Seed for Python, NumPy and torch. The simulator isn't bit-for-bit reproducible, so step-by-step tracking still varies slightly between runs |
+
+The randomness level passed to the environment is taken from the zarr's `.zattrs` (pickles use `low`). It doesn't change the replay, because the start state is overwritten with the recorded one.
 
 The script prints how closely the simulated end effector follows the recording, and whether the task reward fired:
 ```
@@ -511,20 +541,26 @@ Replayed 505 steps (+20 hold) of rollout.pkl (one_leg)
 | Input | Start state | Actions replayed |
 |---|---|---|
 | `.pkl` | **Exact.** Robot joint angles and part poses from the first observation (`env.reset_to`) | Absolute targets built from the recorded EE pose + each delta |
-| `.zarr` | **Approximate.** Zarrs don't store joint angles, so the arm is reset to its default joints and driven to the recorded start EE pose (`--settle-steps`, default 40). Only then are the parts placed at their recorded start poses | `action/pos` for position and gripper. Orientation targets come from the next recorded state (`--zarr-rotation state`, default), because the stored action rotations are scaled down by a processing bug (§10) |
+| `.zarr` | **Approximate.** Zarrs don't store joint angles, so the arm is reset to its default joints (with the env's reset noise switched off) and driven to the recorded start EE pose (`--settle-steps`, default 40). Only then are the parts placed at their recorded start poses | `action/pos` for position and gripper. Orientation targets come from the next recorded state (`--zarr-rotation state`, default), because the stored action rotations are scaled down by a processing bug (§11) |
 
 Variant task names such as `one_leg_full` use the base task's environment; `--task` overrides it.
 
 **What replay can and can't tell you.** Replay runs the recorded actions without feedback, so the robot's motion is reproduced closely but contacts can play out differently.
 
+**Reset randomness is switched off.** A normal `env.reset()` adds random noise to the arm's joints and pushes the parts with random forces. The replay overwrites the start state anyway, but before this was switched off the noise still leaked through: a 7-joint arm reaches the same gripper pose with different elbow positions, and pushed parts can still be moving. The same episode then succeeded in only 1 of 4 identical runs. The script now resets with zero joint noise and zero pushes, and zeroes the parts' velocities when placing them.
+
 | Test episode | EE tracking (mean / max) | Reward fired? |
 |---|---|---|
 | `one_leg` RL rollout pickle (recorded in the same RL env) | 0.07 / 1.01 cm | ✓ |
 | `factory_peg_hole` teleop pickle | 0.01 / 0.25 cm | ✗: the peg stayed in the gripper instead of being released in the hole |
-| `one_leg/teleop/low` zarr, episodes 0–3 | 0.04–0.14 / 0.6–1.8 cm | 1 of 4 |
+| `one_leg/teleop/low` zarr, episodes 0–3 | 0.04–0.14 / 0.5–1.0 cm | 2 of 4 (episodes 2 and 3; episode 3 in 3 of 3 repeats) |
 
 - **Good for** watching any episode, including state-only rollouts, from both cameras; checking that recorded actions are physically consistent (large tracking errors point to bad data or a controller mismatch); and comparing replays side by side with the recorded video.
-- **Not a pass/fail test for teleop data.** Teleop demos were recorded in the teleop environment (`FurnitureSimEnv`), while replay uses the RL environment. Small contact differences at grasps and insertions can prevent the reward from firing even when the motion matches. Replays of RL rollouts, recorded in the same environment, did reproduce success.
+- **Not a pass/fail test for teleop data.** Two things about how teleop demos are recorded ([data_collector_sm.py](../src/data_collection/data_collector_sm.py)) make an exact replay unlikely to trip the reward:
+  - **Success is the operator's judgment.** The episode ends when the operator presses `t`, not when the simulator's assembly check fires, so some demos stop just short of it: in the local `one_leg/teleop/low` zarr, 4 of 50 demos end with the leg outside the simulator's ±20° twist tolerance.
+  - **Idle steps aren't recorded.** Steps without SpaceMouse or keyboard input are skipped (except the 8 steps after a gripper toggle), although the simulation kept running during them. A replay therefore gives parts less time to settle at grasps and insertions.
+
+  Replays of RL rollouts, which record every step and end on the simulator's own success signal, did reproduce success.
 - **Replaying deltas drifts.** Applying the pickle's delta actions to the *simulated* pose (as the upstream `run_sim_env --replay-path` does) compounds errors: 2.5 cm mean drift on the RL rollout above, against 0.07 cm with absolute targets.
 
 The upstream alternative is `python -m furniture_bench.scripts.run_sim_env --furniture one_leg --randomness low --replay-path <episode>.pkl [--record] [--headless]` ([run_sim_env.py](../furniture-bench/furniture_bench/scripts/run_sim_env.py)). It resets to the pickle's first observation in the teleop environment and replays the deltas. It has not been run on this machine.
@@ -549,7 +585,7 @@ The [notebooks/](../notebooks/) folder has more specialized views. Most hard-cod
 
 ### 9.5 Evaluating checkpoints
 
-[src/eval/evaluate_model.py](../src/eval/evaluate_model.py) loads a WandB run (`--run-id`) or a local file (`--wt-path`, through `LocalCheckpointWrapper` in [eval_utils.py](../src/eval/eval_utils.py)), rolls it out in `--n-envs` parallel simulator copies and prints the success rate.
+[src/eval/evaluate_model.py](../src/eval/evaluate_model.py) loads a WandB run (`--run-id`) or a local file (`--wt-path`, through `LocalCheckpointWrapper` in the same file), rolls it out in `--n-envs` parallel simulator copies and prints the success rate.
 
 ```bash
 # 1. Success rate. Compare with paper Table I (one_leg low: DP 54%, ResiP 98%; med: 26% / 76%)
@@ -560,38 +596,305 @@ python -m src.eval.evaluate_model --wt-path checkpoints/rppo/one_leg/low/actor_c
 # 2. Watch live in the IsaacGym viewer: same command with few envs
     ... --n-envs 4 --n-rollouts 4 --visualize
 
-# 3. Record episodes with camera images, then view them with §9.2
-    ... --observation-space image --save-rollouts --save-failures --save-rollouts-suffix eval_vid
-python scripts/visualize_data.py video $DATA_DIR_RAW/raw/diffik/sim/one_leg/rollout/low/eval_vid/failure --episodes 0 1 2
+# 3. Record episodes with camera images (keep it to ONE round: --n-rollouts = --n-envs), then make mp4s with §9.2
+python -m src.eval.evaluate_model --wt-path checkpoints/rppo/one_leg/low/actor_chkpt.pt \
+    -f one_leg --randomness low --n-envs 32 --n-rollouts 32 --max-rollout-steps 700 \
+    --action-type pos --observation-space image --save-rollouts --save-failures --save-rollouts-suffix eval_vid
+
+# Turn the saved episodes into mp4s
+python scripts/visualize_data.py video data/raw/diffik/sim/one_leg/rollout/low/eval_vid/success --episodes 0 1 2
+python scripts/visualize_data.py video data/raw/diffik/sim/one_leg/rollout/low/eval_vid/failure --episodes 0 1 2
 ```
 
-- **Recording (3)** is the flag set the authors used to record BC-vs-RL videos ([9_ol_bc_vs_rppo_pert.sh](../scripts/ant_local/rollout_for_render/9_ol_bc_vs_rppo_pert.sh)). With `--observation-space image` the simulator renders both cameras, so saved pickles contain real images; a state policy still works because the observations still include `parts_poses`. Rollouts saved with `--observation-space state` can be re-rendered with §9.3 instead.
-- **Save location.** Episodes go to `$DATA_DIR_RAW/raw/diffik/sim/<task>/rollout/<randomness>/eval_vid/{success,failure}/`. The failures show fastest how a policy fails.
-- **Other useful flags:**
+#### Parameters
 
-| Flag | Effect |
-|---|---|
-| `--wt-type best_success_rate\|best_test_loss\|last` | Which weights to load from a WandB run |
-| `--store-video-wandb --wandb` | Send videos to WandB instead of saving pickles |
-| `--store-full-resolution-video` | Don't downsize saved images |
-| `--break-on-n-success --stop-after-n-success N` | Stop after N successes (used to generate expert data) |
-| `--compress-pickles` | Save as `.pkl.xz` |
+Exactly one of `--wt-path`, `--run-id`, `--sweep-id` or `--project-id` must be given. `--task` is always required.
 
+**What to evaluate**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--wt-path FILE` | – | Local checkpoint (`.pt`). Its stored config rebuilds the policy, so `bc` and `rppo` files use the same command |
+| `--run-id P/ID [P/ID ...]` | – | One or more WandB runs as `<project>/<run id>`; weights are downloaded from the run. Needs WandB login and access to the project |
+| `--sweep-id ID` / `--project-id P` | – | Evaluate every run in a WandB sweep / project |
+| `--wt-type NAME` | `best_success_rate` | WandB runs only: which saved weights to load: `best_success_rate`, `best_test_loss` or `last`. Ignored with `--wt-path` |
+| `--run-state S [S ...]` | all | WandB runs only: keep only runs in these states: `running`, `finished`, `failed`, `crashed` |
+| `--eval-top-k K` | all | WandB runs only: evaluate only the K runs with the highest stored success rate |
+
+**Environment and rollouts**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--task`, `-f NAME` | required | Simulator task: `one_leg`, `round_table`, `lamp`, `mug_rack`, `factory_peg_hole` (plus `square_table`, `desk`, `cabinet`, `bimanual_insertion`, which have no released checkpoints) |
+| `--randomness LEVEL` | `low` | Initial-scene randomness: `low`, `med` or `high`. See *Randomness settings* below |
+| `--n-envs N` | `1` | Parallel simulator copies. Bounded by GPU memory; about 16–64 on an 8 GB GPU in state mode, fewer with images |
+| `--n-rollouts N` | `1` | Total episodes. Runs in rounds of `--n-envs`, and the count is **truncated** to `n_rollouts // n_envs` rounds, so use a multiple of `--n-envs`. A value below `--n-envs` runs nothing |
+| `--max-rollout-steps N` | per-task timeout | Episode length limit in 10 Hz steps. Always set it (values in the table below); the default is longer than the paper's and inflates success |
+| `--n-parts-assemble N` | all parts | How many part pairs must be assembled to count as success. Also sets the default timeout (1000 steps × N) |
+| `--observation-space state\|image` | `state` | `image` also renders both cameras. The policy still gets the state it needs; use it to save rollouts with real images |
+| `--action-type pos\|delta\|relative` | `pos` | Action format of the environment. Must match the checkpoint's `control.control_mode` (an assertion checks this); all released checkpoints use `pos`. `relative` is run as `pos` |
+| `--april-tags` | off | Use the original FurnitureBench part meshes with AprilTag textures instead of the tag-free assets in `src/assets` |
+| `--visualize` | off | Open the IsaacGym viewer (turns off headless mode). Keep `--n-envs` small |
+| `--gpu N` | `0` | CUDA device for the policy and the simulator |
+| `--verbose`, `-v` | off | Print the environment's setup output |
+
+**Saving rollouts**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--save-rollouts` | off | Save each episode as a raw pickle (not an mp4) under `$DATA_DIR_RAW/raw/diffik/sim/<task>/rollout/<randomness>/[<suffix>/]success/`. **Nothing is written until all `--n-rollouts` episodes have finished**: every episode, including its camera frames, is kept in RAM until then. With `--observation-space image` that is about 460 KB per env-step, so ~10 GB per round of 32 envs × 700 steps. 256 rollouts need ~80 GB and get the process killed on a 60 GB machine, leaving the folder empty. Record one or two rounds per run and repeat the command for more; each run adds new pickles |
+| `--save-failures` | off | Also save failed episodes (to `…/failure/`). Needs `--save-rollouts` |
+| `--save-rollouts-suffix S` | `""` | Extra folder level under the randomness folder, to keep evaluations apart |
+| `--store-full-resolution-video` | off | Save images at full camera resolution instead of downsizing them to 240×320 |
+| `--compress-pickles` | off | Save as `.pkl.xz` |
+| `--break-on-n-success` + `--stop-after-n-success N` | off, `0` | Stop once at least N successes have been collected (checked after each round). Used to generate expert data |
+| `--record-for-coverage` | off | Instead of full episodes, save only each episode's first state and outcome to `first_states.npz`, for coverage analysis. Needs `--save-rollouts` |
+
+**Reporting results (WandB)**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--wandb` | off | Write success rate, success count, rollout count and returns into the run's WandB summary. With `--wt-path`, writes them to `<checkpoint>.summary.json` next to the checkpoint instead |
+| `--if-exists skip\|overwrite\|append\|error` | `error` | What to do when the run already has a stored success rate. `append` pools the new episodes with the stored ones. Irrelevant for `--wt-path` (no stored results) |
+| `--max-rollouts N` | – | Skip runs that already have at least N stored rollouts |
+| `--multitask` | off | Prefix the summary keys with the task name (`one_leg/success_rate`) |
+| `--store-video-wandb` | off | Opens the WandB run for video logging (needs `--wandb`). As written, `evaluate_model` doesn't pass `save_rollouts_to_wandb` to the rollout code, so **no videos are uploaded** |
+| `--continuous-mode`, `--continuous-interval S` | off, `60` | Keep polling the sweep/project every S seconds and evaluate new runs |
+| `--prioritize-fewest-rollouts` | off | After each run, re-sort runs by stored rollout count and start again with the fewest |
+| `--ignore-currently-evaluating-flag` | off | Evaluate runs even if another evaluator has marked them `currently_evaluating` |
+
+**Not usable:** `--leaderboard` (an assertion rejects it), `--action-horizon` (parsed but never used). `--controller` and `--use-new-env`, which the authors' `scripts/ant_local/` and `slurm/` commands pass, no longer exist; the script stops with "unrecognized arguments". Remove them when reusing those commands.
+
+**Fixed inside the script:** the diffusion policy samples with 4 DDIM steps (paper Table IV), and the environment uses 6D rotation actions.
+
+#### Randomness settings
+
+`--randomness` selects how much the initial scene varies in the RL env (§2.2). Only `low`, `med` and `high` are valid here. Folder labels such as `med_perturb` make the env fail with `Unknown initialization mode`.
+
+| Level | Fixture offset | Part push at reset (max force / torque) | Arm joint noise | Paper Table I |
+|---|---|---|---|---|
+| `low` | ±2 cm | 0.2 / 0.007 | ±5° | All 6 tasks |
+| `med` | ±4 cm | 0.5 / 0.01 | ±10° | `one_leg`, `round_table`, `lamp` |
+| `high` | ±6 cm | 0.75 / 0.015 | ±13° | Not reported |
+
+**Match the checkpoint to its level.** Each released checkpoint was trained at the level in its path (`checkpoints/<kind>/<task>/<level>/`), so evaluate it at that level to compare with the paper. Evaluating a `low` checkpoint at `med` is a valid robustness test, but has no paper number.
+
+| Task | Levels with checkpoints | Paper success, DP → ResiP (low / med) | `--max-rollout-steps` |
+|---|---|---|---|
+| `one_leg` | low, med | 54 → 98 / 26 → 76 | 700 (paper); authors' eval scripts often use 750 |
+| `round_table` | low, med | 12 → 94 / 4 → 77 | 1000 |
+| `lamp` | low, med | 7 → 97 / 2 → 70 | 1000 |
+| `mug_rack` | low | 26 → 88 / – | 400 |
+| `factory_peg_hole` | low | 5 → 99 / – | 200; **required**, the default lookup has no entry for this task and fails |
+
+Always pass `--max-rollout-steps`. Without it the timeout comes from [tasks.py](../src/common/tasks.py): 1000 steps per part (`one_leg` 1000; `round_table`, `lamp`, `mug_rack` 2000). That is longer than the paper's episodes, so success rates come out higher than Table I. The values above are the RL episode lengths from paper Table VI and the authors' slurm scripts.
+
+**Perturbations during the episode (paper Fig. 9)** can't be enabled from the command line. [rollout.py:190](../src/eval/rollout.py#L190) hard-codes `env.step(action, sample_perturbations=False)`. Changing it to `True` makes each step push about 1% of parts with the level's force and torque limits. The paper reports that ResiP loses 12 points under perturbation and chunked policies 19–26. The RL training wrapper has its own switch (`sample_perturbations` in [env_rl_wrapper.py](../src/gym/env_rl_wrapper.py)).
+
+**Demos and evaluation use the same randomization.** The SpaceMouse collector creates the same RL env with the same `--randomness` (§2.2), and the released `one_leg` demos were recorded after it switched to that env. Demos collected with the older scripted collector or `run_sim_env` use the original env's uniform placement instead.
+
+#### Notes
+
+- **Recording (3)** is the flag set the authors used to record BC-vs-RL videos ([9_ol_bc_vs_rppo_pert.sh](../scripts/ant_local/rollout_for_render/9_ol_bc_vs_rppo_pert.sh)). With `--observation-space image` the simulator renders both cameras, so saved pickles contain real images. Rollouts saved with `--observation-space state` have placeholder images; re-render them with §9.3.
+- **The failures folder** shows fastest how a policy fails.
 - **During training.** [bc.py](../src/train/bc.py) runs simulator rollouts every `training.eval_every` epochs, and [residual_ppo.py](../src/train/residual_ppo.py) evaluates every 5th iteration. Both log success rates (and videos where enabled) to WandB, so those curves are the main check while training.
 
 **Before running on this machine:**
 - **Checkpoints.** The four `one_leg` checkpoints are in `./checkpoints/`; get others with `scripts/download_checkpoints.py` (§8).
+- **Library path.** Export `LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` (§9.1), as for the other simulator tools.
 - **8 GB GPU.** Use `--n-envs` of about 16–64 instead of the paper's 1024. Image-mode rollouts are slower and use more memory.
 - **Status.** `evaluate_model --wt-path` on the released checkpoints hasn't been run on this machine yet.
 - **meshcat** isn't installed in the `resip` env; only the real-robot scripts need it.
 
 ---
 
-## 10. Known pitfalls
+## 10. Collecting demonstrations
+
+The repo has three collectors. Only the SpaceMouse simulation collector was used for the released demos.
+
+| Collector | Command | Environment | Status |
+|---|---|---|---|
+| **Simulation, SpaceMouse** (+ keyboard) | `python -m src.data_collection.teleop` ([teleop.py](../src/data_collection/teleop.py) → [data_collector_sm.py](../src/data_collection/data_collector_sm.py)) | `FurnitureRLSimEnv`, the same env as RL and evaluation | Used for the released demos (since 2024-05-15). Not run on this machine yet |
+| Simulation, scripted | `python -m src.data_collection.scripted` ([scripted.py](../src/data_collection/scripted.py)) | Original `FurnitureSimEnv`, OSC controller, FurnitureBench's hard-coded assembly script | **Doesn't start as written**: it calls `trajectory_save_dir(environment=…)` without `controller`, which don't match the function's arguments (§10.7) |
+| Real robot, SpaceMouse | `python -m src.real.teleop_sm` ([teleop_sm.py](../src/real/teleop_sm.py)) | Franka + two RealSense cameras | Needs the authors' internal `rdt` package (§10.7) |
+
+### 10.1 Setup
+
+```bash
+# SpaceMouse driver (from the README)
+pip install numpy termcolor atomics scipy
+pip install git+https://github.com/cheng-chi/spnav
+sudo apt install libspnav-dev spacenavd
+sudo systemctl start spacenavd
+
+# every session
+conda activate resip
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export DATA_DIR_RAW=/home/kaiyuan.luo/ResiP/data      # where pickles are written
+```
+
+- **A display is required.** The collector always opens the IsaacGym viewer; you teleoperate by watching it.
+- **The keyboard is read through `pynput`**, which needs an X session. The terminal also needs focus to receive Enter at the start of each episode.
+
+### 10.2 Running
+
+```bash
+python -m src.data_collection.teleop --furniture one_leg --randomness low --ctrl-mode diffik --num-demos 50
+```
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--furniture NAME` | required | Task to load, e.g. `one_leg`, `round_table`, `lamp`, `mug_rack`, `factory_peg_hole` (any key of FurnitureBench's `config["furniture"]`) |
+| `--ctrl-mode diffik\|osc` | required | Low-level controller. The collector asserts `diffik`; pass `diffik` |
+| `--randomness low\|med\|high` | `low` | Initial-scene randomness, in the RL env's sense (§2.2): fixture offset, pushes on the parts and arm joint noise at each reset |
+| `--num-demos N` | `100` | Stop after N **successful** demos. Failures don't count |
+| `--save-failure` | off | Also save episodes you end with `n`, to `failure/` |
+| `--sample-perturbations` | off | While you are moving, randomly push about 1% of parts each step with the level's force limits. Saves to `<level>_perturb/` |
+| `--resume-dir DIR` | – | Meant to continue from the **last** state of saved pickles in `DIR`, preloading their steps into the new episode. **Broken:** it reads the misspelled key `state["r/manuewards"]` and crashes with `KeyError` |
+| `--no-ee-laser` | laser on | Hide the laser drawn from the gripper (a visual aid for alignment in the viewer; not recorded) |
+| `--draw-marker` | off | Show AprilTag markers on the parts. Off matches the released data |
+| `--gpu-id N` | `0` | GPU for simulation and rendering |
+
+### 10.3 Controls and episode flow
+
+| Input | Action |
+|---|---|
+| SpaceMouse motion | Moves the gripper in 6-DoF: translation up to 0.3 m/s × 1.8 and rotation up to 0.7 rad/s × 4, with a 0.05 dead zone. Each command is capped at 2.5 cm and 20° per step |
+| SpaceMouse button (either) | Toggle gripper open/close |
+| `w`/`s`, `a`/`d`, `q`/`e` | Move along −x/+x, −y/+y, −z/+z (robot base frame) |
+| `j`/`l`, `i`/`k`, `u`/`o` | Rotate about x, y, z |
+| `z` | Toggle gripper |
+| `[` / `]` | Decrease / increase the keyboard step size |
+| **`t`** | **End the episode as a success** and save it |
+| `y` | Success, and also write the final relative pose of each assembled pair to a JSON next to the task's assembly file. Used to set up the reference poses of scanned tasks; works only for tasks with an `assembly_json_fname` in the config (`mug_rack`, `factory_peg_hole`, `factory_nut_bolt`). For others such as `one_leg` the pickle is saved, then the collector crashes on the missing key |
+| `` ` `` | Mark a skill boundary at this step (stored as 1 in the pickle's `skills`) |
+| `n` | End as a failure (saved only with `--save-failure`) |
+| `b` | Undo: drop the last 10 recorded steps and reset the simulator to the state before them |
+| `p` / `c` | Pause / resume recording. You can still move while paused, e.g. to reposition |
+
+There is no quit key: the run ends after `--num-demos` successes, or stop it with Ctrl-C. Keys `r` and the digits are read by the keyboard interface but ignored by this collector.
+
+**One episode:**
+1. The scene resets to a new random layout. **Press Enter** in the terminal to start.
+2. Wait about 2 s for the robot to settle; nothing is recorded before that.
+3. Teleoperate the task. For `one_leg`: push the tabletop into the corner of the fixture, pick up the leg, insert it into a hole and screw it in.
+4. Keep screwing until the terminal prints **`Part assembled!`**. That is the simulator's success check firing: the leg within 5 mm of fully seated, and its twist within about ±20° of its tightened angle.
+5. Release the leg, move away, and press **`t`**.
+
+### 10.4 Collecting good demos
+
+**What the paper says.** Almost nothing about *how* the demos were collected: "50 demonstrations in simulation by teleoperating the robot" (§II-B), collected "using a SpaceMouse" (§III-A), at the same randomness levels later used for evaluation (App. II-B). It calls collecting 100k human demos "not feasible" (§VI), which is partly why the method leans on RL and synthetic data. The authors' earlier paper *Juicer: Data-efficient imitation learning for robotic assembly* (ref. [22]) targets few-demo learning on the same FurnitureBench tasks and is the better source for collection advice (not reviewed here).
+
+**What the released demos look like** (measured from the `one_leg` teleop zarrs; a concrete target):
+
+| | `low` | `med` |
+|---|---|---|
+| Demos | 50 | 50 |
+| Length (steps at 10 Hz) | 392–579, mean 467 | mean 482 |
+| Passed the simulator's check (§10.5) | 43 / 50 | 50 / 50 |
+
+- **The same strategy every time:** push the tabletop into the fixture corner, grasp the leg, insert, then screw with several regrasp cycles (the repeated gripper open/close in `visualize_data.py plot`).
+- **All finish well inside the 700-step episode limit** used by RL and evaluation.
+
+#### What makes a demo useful for training
+
+These follow from how the method works and from the paper's failure analysis; tips marked *(inference)* are not stated in the paper.
+
+1. **Cover the initial-state distribution you'll evaluate on.** The residual policy only makes *local* corrections, and the paper attributes ResiP's lower `med` score (76% vs 98% at `low`) to scenes that "deviate too far" from what the base policy handles (§IV-A, §VI).
+   - Collect with the same `--randomness` you'll evaluate at.
+   - Don't reset or skip awkward layouts; those are the states the policy most needs to have seen.
+   - Check coverage with `visualize_data.py plot`: the overview's initial-part-position panel should show a spread matching the level.
+2. **Be consistent.** With 50 demos, one repeated strategy (same corner, similar grasp point on the leg, same push-then-grasp order) is easier to imitate than several. Two of the paper's failure modes come from the grasp: "bad grasp for insertion" (Fig. 7) and "unseen in-hand poses" (Fig. 10B). Grasp the leg the same way each time.
+3. **Be precise at the bottleneck.** The most common base-policy failure is "pushing the leg down before achieving perfect alignment with the hole" (§IV-A). Line the leg up over the hole first, then lower it, then screw.
+4. **End only on a real success.** Press `t` only after the terminal prints `Part assembled!` (§10.3), and remove demos without the success marker afterwards (§10.5).
+5. **Stay inside the time limit.** Aim to finish in about 400–600 steps. A policy that imitates a slow demo may run out of the 700 steps *(inference)*.
+6. **Quality matters more than quantity.**
+   - **More demos give diminishing returns:** Fig. 1 shows BC saturating at about 80% even with 100k demos.
+   - **The RL stage mainly needs a base policy that sometimes succeeds**, because the reward is sparse and exploration depends on it. The paper started from 54% (`low`) and 26% (`med`), and notes that going from 10% to 26% made fine-tuning "far easier" (App. VIII).
+   - **Target:** 50 clean, consistent, fully assembled demos per level is the paper's recipe.
+
+#### SpaceMouse tips
+
+These follow from how the collector behaves (§10.3, §10.5):
+
+- **Stop instead of pausing.** Steps with no input aren't recorded, so hesitating costs nothing. Avoid `p`: if you keep moving while paused, the recording jumps between two states.
+- **Use `b` (undo) to recover from mistakes.** It rewinds the last 10 recorded steps and resets the simulator to match, so the demo stays consistent. A long fumbled recovery teaches the policy to fumble; small corrective adjustments near the hole are fine and arguably useful *(inference)*.
+- **Screw with the keyboard.** `u`/`o` rotate by a fixed 0.2 rad (≈11°) about vertical per press, easier to do cleanly than twisting the cap. Keyboard input overrides the SpaceMouse for that step. Both rotate about the base frame's vertical, so a vertical leg turns about its own axis either way.
+- **Keep the laser on** (the default; `--no-ee-laser` hides it). It shows where the gripper points, which helps line up over the hole, and isn't recorded.
+- **Slow down near contact.** Full deflection moves up to 2.5 cm per step; light pressure near the hole gives finer, smoother motion.
+- **Review each batch before training** with `visualize_data.py info`, `plot` and `video` (§10.6): look for outlier lengths, missing success markers and gripper chatter.
+
+### 10.5 What gets recorded
+
+**Files:** one pickle per episode at `$DATA_DIR_RAW/raw/diffik/sim/<task>/teleop/<randomness>[_perturb]/{success,failure}/<YYYY-MM-DDTHH:MM:SS>.pkl` (format in §4). Besides observations, actions, rewards and `success`, each pickle stores `skills`, `furniture`, `error` / `error_description`, and `metadata` with the teleop settings (frequency 10 Hz, command latency, dead zone, maximum speeds, SpaceMouse scalings).
+
+**Which steps are kept:**
+- **Only steps with input.** A step is recorded when the SpaceMouse or keyboard commands motion. Idle steps are skipped even though the simulation keeps running, except the 8 steps after a gripper toggle, so the gripper closing is captured.
+- **Not the first ~2 s** after pressing Enter, and nothing while paused.
+- **Undo removes steps.** `b` deletes the last 10 recorded steps from the episode.
+
+**Success labels come from the operator.** The collector's env is created with `manual_done=True`, so the simulator never ends or labels an episode; pressing `t` does. The simulator's check still runs, and the step where it first fires is marked in `rewards`:
+
+| Demos | Marker | Episodes with the marker | When the operator pressed `t` |
+|---|---|---|---|
+| `one_leg/teleop/med` (recorded 2024-05-16 to 05-17) | reward `1` | 50 / 50 | – |
+| `one_leg/teleop/low` (2024-05-27 to 05-28) | `None` in the pickle, NaN in the zarr | 43 / 50 | 31–57 steps after the marker (median 40) |
+| `one_leg/teleop/high` (2024-05-27) | NaN | 49 / 50 | – |
+
+`None`/NaN appears because later env code returns `print("Part assembled!")` (i.e. `None`) from `_reward` when `manual_done` is set. The 7 `low` episodes and 1 `high` episode without a marker were saved as successes but never passed the simulator's check. **Press `t` only after `Part assembled!` has been printed.** To find unmarked episodes in a folder of pickles:
+
+```python
+from pathlib import Path
+from src.visualization.render_mp4 import unpickle_data
+for f in sorted(Path("data/raw/diffik/sim/one_leg/teleop/low/success").glob("*.pkl*")):
+    r = unpickle_data(f)["rewards"]
+    if not any(x is None or x == 1 for x in r):
+        print("never passed the simulator's check:", f.name)
+```
+
+### 10.6 After collecting
+
+```bash
+# 1. Inspect: counts, lengths, trajectories, videos (§9.2)
+python scripts/visualize_data.py info  data/raw/diffik/sim/one_leg/teleop/low/success
+python scripts/visualize_data.py video data/raw/diffik/sim/one_leg/teleop/low/success --episodes 0 1 2 --max-files 5
+# 2. Remove bad demos (e.g. those without the success marker above), then process into a zarr (§5)
+python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s teleop -r low -o success
+# 3. Train (IMPLEMENTATION_GUIDE.md, Stage 1)
+```
+
+- **Processing shrinks rotation actions** (§11, item 4). This affects newly collected data too; fix the clip before processing if you want the operator's full rotations in `action/pos`.
+- **The paper used 50 demos per task and randomness level** (§II-B).
+- **Replaying a new demo in the simulator** (§9.3) is a quick check that it's physically consistent, but for the reasons above an exact replay rarely re-triggers the success check.
+
+### 10.7 Other collectors
+
+**Scripted (`scripted.py`).** Meant to generate demos without a human, using FurnitureBench's hard-coded assembly script in the original `FurnitureSimEnv` with the OSC controller. It fails before collecting anything: it calls `trajectory_save_dir(environment="sim", …)`, but the function takes `controller` (required) and `domain`, not `environment`. The authors' demos weren't collected this way.
+
+**Real robot (`src/real/teleop_sm.py`).** Same SpaceMouse scheme on a real Franka (Polymetis) with two RealSense D435 cameras, with a meshcat visualization.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `--save_dir DIR` | required | Folder for the pickles. They're written directly into it, with no `success/` or `failure/` subfolder |
+| `--furniture NAME` | required | Task name stored in the pickle |
+| `-p`, `--port_vis N` | `6000` | meshcat visualization port |
+| `--frequency N` | `10` | Control and recording rate (Hz) |
+| `--command_latency S` | `0.01` | Time budget for sending each command |
+| `--deadzone X` | `0.05` | SpaceMouse dead zone |
+| `--max_pos_speed V` / `--max_rot_speed W` | `0.3` / `0.7` | Maximum speeds (m/s, rad/s) |
+| `--use_lcm` | off | Use LCM for robot communication |
+
+- **Every saved demo is marked as a success** ([teleop_sm.py:448](../src/real/teleop_sm.py#L448)), so review and delete bad ones yourself.
+- **Before processing,** move the pickles to `$DATA_DIR_RAW/raw/diffik/real/<task>/teleop/<randomness>/success/`, then run `process_pickles -d real`.
+- **Dependencies:** it imports the authors' lab-internal `rdt` package (camera streaming, Polymetis helpers), and meshcat, which isn't installed in the `resip` env. Camera serial numbers are set in [serials.py](../src/real/serials.py).
+
+---
+
+## 11. Known pitfalls
 
 1. **Rendered data is filed under a domain the loader never searches.** On S3 it lives in `processed/diffik/sim2real/…`, but training globs only `processed/<controller>/<environment>/…` with `environment ∈ {sim, real}`. Copy the zarrs into `sim/<task>/…`, or list them with `data.data_paths_override`.
 2. **Task names in IMPLEMENTATION_GUIDE.md don't exist on S3.** Stage 5 of IMPLEMENTATION_GUIDE.md uses `one_leg_real` and `one_leg_render_rppo`; on S3 they are `one_leg_full` / `one_leg_full_new` and `one_leg_render_rppo_{1,black,brighter}`. Also use `task=`, not the outdated `furniture=` key.
-3. **`reward`, `skill` and `augment_states` in zarrs aren't meaningful.** In the `one_leg` teleop zarrs, `reward` is all zeros plus one stray NaN per episode, and the other two are all zeros. `StateDataset` builds its own reward (1 at each episode end) when it needs one. RL rewards come from the simulator.
+3. **The zarr `reward` field is a marker, not a clean reward.** In teleop data it marks the step where the simulator detected assembly, as **1** in demos recorded before about 2024-05-20 (`one_leg/teleop/med`) and as **NaN** in later ones (`low`, `high`), because the collector's env returns `None` for that step (§10.5). Episodes without the marker were labelled successful by the operator but never passed the simulator's check. `skill` and `augment_states` are all zeros in the released `one_leg` data. BC training doesn't use `reward`; `StateDataset` builds its own (1 at each episode end) when it needs one, and RL rewards come from the simulator.
 4. **Processing scales down every episode's rotation actions.** `clip_quat_xyzw_magnitude` ([utils.py:103](../src/data_processing/utils.py#L103)) computes one norm over the *whole* (T, 4) array it is given, and `process_pickles.py` passes a whole episode. So whenever an episode's rotations add up to more than 0.35 rad, every rotation step in it is shrunk by the same factor. In all three released `one_leg` teleop zarrs, every episode's combined rotation is exactly 0.35 rad and no single step exceeds 2.1°. The recorded *states* are unaffected; only `action/pos` and `action/delta` orientations are. The code has behaved this way since April 2024 (commit `b534d7a`), so the released checkpoints were most likely trained on data like this; that isn't verified. If you reprocess data, clip per step instead (e.g. `np.linalg.norm(delta_rotvec, axis=-1, keepdims=True)`). The position clip (each axis to ±2.5 cm) is applied per element and is fine.
 5. **State-only rollouts have 2×2 placeholder images.** This covers everything in `coverage/` and `distill/`, and any rollout saved with `--observation-space state`. Some processed rollout zarrs do have real IsaacGym images (e.g. `rppo_low_*`, `bc_low_*`). Check with `scripts/visualize_data.py info` before training an image policy.
 6. **Real teleop marks every saved demo as a success.** Filter bad demos yourself before processing.
