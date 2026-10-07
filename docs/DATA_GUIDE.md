@@ -819,7 +819,7 @@ These follow from how the collector behaves (§10.3, §10.5):
 
 - **Stop instead of pausing.** Steps with no input aren't recorded, so hesitating costs nothing. Avoid `p`: if you keep moving while paused, the recording jumps between two states.
 - **Use `b` (undo) to recover from mistakes.** It rewinds the last 10 recorded steps and resets the simulator to match, so the demo stays consistent. A long fumbled recovery teaches the policy to fumble; small corrective adjustments near the hole are fine and arguably useful *(inference)*.
-- **Screw with the keyboard.** `u`/`o` rotate by a fixed 0.2 rad (≈11°) about vertical per press, easier to do cleanly than twisting the cap. Keyboard input overrides the SpaceMouse for that step. Both rotate about the base frame's vertical, so a vertical leg turns about its own axis either way.
+- **Screw with the keyboard.** `u`/`o` command a fixed 0.2 rad (≈11°) per press about the **gripper's own z axis** (the env applies delta rotations in the gripper frame), so a leg aligned with the gripper turns about its own axis. The SpaceMouse twist instead rotates about the base's vertical, plus whatever tilt your hand adds to the cap. Keyboard input overrides the SpaceMouse for that step. Holding the key auto-repeats past the 20°-per-step clip, which the arm realizes as about 7.9° per step; a single tap gives about 4.5°. The released `one_leg` demos screw at exactly these two rates, with almost no tilt (measured 2026-10-06), so the authors very likely screwed this way.
 - **Keep the laser on** (the default; `--no-ee-laser` hides it). It shows where the gripper points, which helps line up over the hole, and isn't recorded.
 - **Slow down near contact.** Full deflection moves up to 2.5 cm per step; light pressure near the hole gives finer, smoother motion.
 - **Review each batch before training** with `visualize_data.py info`, `plot` and `video` (§10.6): look for outlier lengths, missing success markers and gripper chatter.
@@ -887,6 +887,165 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 - **Every saved demo is marked as a success** ([teleop_sm.py:448](../src/real/teleop_sm.py#L448)), so review and delete bad ones yourself.
 - **Before processing,** move the pickles to `$DATA_DIR_RAW/raw/diffik/real/<task>/teleop/<randomness>/success/`, then run `process_pickles -d real`.
 - **Dependencies:** it imports the authors' lab-internal `rdt` package (camera streaming, Polymetis helpers), and meshcat, which isn't installed in the `resip` env. Camera serial numbers are set in [serials.py](../src/real/serials.py).
+
+### 10.8 Teleoperating a different arm in simulation
+
+How to replace the simulated Franka Panda with another arm, so that sim demos, residual RL and evaluation all run on the robot you will deploy on.
+
+#### When you need this
+
+The policies never see joint angles. They observe the fingertip pose (`k_ee_link`) in the robot base frame, the gripper width, the part poses and (π_real only) the two camera images. They output a target fingertip pose plus a gripper command, and diff-IK converts it to joint targets. So the arm model matters only through:
+
+| What differs on the new robot | Effect on the data | Swap the sim robot? |
+|---|---|---|
+| Gripper (finger shape, stroke, force) | Grasps, insertion and screwing contacts change | **Yes**, and re-collect demos |
+| Joint limits, reach, number of joints | Some Panda tip trajectories become infeasible (often the wrist roll while screwing) | Yes, or at least apply the new limits |
+| Appearance | The front camera sees the arm; the wrist camera sees the fingers | Only for image policies and re-rendering |
+| Base position relative to the table | The same scene sits at different robot-frame coordinates | Match it in sim (Step 4) |
+
+**FR3 with a Franka Hand** has the Panda's kinematics and hand, so only the joint limits differ. Keep the Panda URDF and change only its `<limit>` values (Step 1, then Step 8). As of 2026-10-06, 428 of the 437 local `one_leg` sim pickles stay within [fr3/joint_limits.yaml](../src/assets/franka_description_ros/franka_description/robots/fr3/joint_limits.yaml). Most of the 9 that don't leave it through joint 7 while screwing.
+
+#### What the env assumes about the robot
+
+Sim teleop, residual RL and evaluation all build `FurnitureRLSimEnv`. It and its parent class are in [furniture_rl_sim_env.py](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py), so that one file holds nearly everything to change (all line numbers below are in it unless another file is named):
+
+| Assumption | Where |
+|---|---|
+| URDF path `franka_description_ros/.../franka_panda.urdf`, Collada visual meshes (`flip_visual_attachments=True`) | `_import_franka_asset`, [1666-1678](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1666-L1678) |
+| Link names `k_ee_link` (fingertip) and `panda_link0` (base) | [294-295](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L294-L295), [414](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L414) |
+| 7 arm DOFs followed by 2 prismatic finger DOFs (9 in total) | DOF properties [422-441](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L422-L441); default pose [446-452](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L446-L452); tensor views [729-746](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L729-L746); `simulate_step` [964-981](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L964-L981); `_read_robot_state` [1174-1197](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1174-L1197); `gripper_width` [1234-1235](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1234-L1235); `reset_env_to` [1433-1444](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1433-L1444); `_reset_frankas` [2078-2094](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L2078-L2094) |
+| Base at `(-0.3, 0, 0.415)` with **no rotation**. `get_ee_pose` subtracts the base position but not its rotation | [279-291](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L279-L291), [1226-1232](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1226-L1232) |
+| Arm joint drive: position mode, stiffness 1000, damping 200 | [118-119](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L118-L119), [431-434](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L431-L434) |
+| Home joints `reset_joints`; per-task `max_gripper_width` (0.065 m for `one_leg`) | [config.py:21-50](../furniture-bench/furniture_bench/config.py#L21-L50) |
+| Finger drive: force 13, friction 15 | [sim_config.py:59-77](../furniture-bench/furniture_bench/sim_config.py#L59-L77) |
+| "Gripper is open" thresholds of 0.06 m and 0.05 m | [data_collector_sm.py:472](../src/data_collection/data_collector_sm.py#L472), [:550](../src/data_collection/data_collector_sm.py#L550) |
+| Wrist camera mounted on `k_ee_link` at `(-0.04, 0, -0.05)`, pitched −70° | [647-658](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L647-L658) |
+
+The diff-IK controller ([diffik.py](../furniture-bench/furniture_bench/controllers/diffik.py)) has no robot-specific code: it solves `lstsq(J, error / 0.1)` with whatever Jacobian the env passes in.
+
+#### Step 1. Prepare the URDF
+
+Build or adapt the new robot's URDF so that it follows the Panda's conventions. The env code then needs the fewest changes:
+
+1. **Base link at the mounting point**, z up, x pointing toward the table. Set `fix_base_link` (already set in the loader).
+2. **Arm joints first, then exactly two prismatic finger joints.** Each finger moves from 0 to half the stroke, along ±y of the hand, like `panda_finger_joint1/2`. IsaacGym ignores `<mimic>`, and the env drives both fingers separately. Model linkage grippers (e.g. a Robotiq 2F-85) as two prismatic fingers carrying the real pad geometry: the pads are what touch the parts.
+3. **A fixed `k_ee_link` at the fingertip center, with Franka's axis convention:** z points out of the gripper (approach direction), and the fingers close along y. On the Panda this frame is 0.1034 m past `panda_hand`, and `panda_hand` is rotated −45° about z from the flange. Every pose in the data is a pose of this frame: states, actions, the teleop rotation axes and the start orientation. Keeping the convention keeps demos comparable across robots. On the real robot, re-measure the tip ↔ flange transform for the new hand; it replaces the Panda's `convert_tip2wrist`.
+4. **Real joint limits.** IsaacGym enforces the URDF's `<limit lower upper>`, so teleop stops where the real robot would. For an FR3 this is the only change: copy `franka_panda.urdf` and edit the `<limit>` lines of `panda_joint1`–`7`. Take the limits from the datasheet for your system version.
+5. **Collision meshes.** Use simplified or convex meshes for the links, and accurate meshes for the fingers.
+6. **Location.** The env loads robot files from `furniture-bench/furniture_bench/assets_no_tags/` by default, and from `furniture-bench/furniture_bench/assets/` with `--draw-marker` / `april_tags`. Put the URDF and its meshes in the same relative place under both, e.g. `franka_description_ros/<robot>/<robot>.urdf`. (`turn_off_april_tags()` in `src/gym` patches the original `furniture_sim_env` module, not this one, so it doesn't change where this env loads from.)
+
+#### Step 2. Load it and check the DOF order
+
+Point `_import_franka_asset` at the new file. Environment variables keep the Panda as the default (add `import os` at the top of the file):
+
+```python
+def _import_franka_asset(self):
+    self.franka_asset_file = os.environ.get(
+        "RESIP_ROBOT_URDF",
+        "franka_description_ros/franka_description/robots/franka_panda.urdf",
+    )
+    asset_options = gymapi.AssetOptions()
+    ...
+    asset_options.flip_visual_attachments = os.environ.get("RESIP_ROBOT_FLIP_VISUALS", "1") == "1"
+```
+
+`flip_visual_attachments` corrects the Y-up Collada meshes of the Franka description, so keep it on for the Panda and for an FR3-limits copy of its URDF. Most other robots ship Z-up STL/OBJ meshes and need `RESIP_ROBOT_FLIP_VISUALS=0`; otherwise their visuals appear rotated by 90° while the collisions are correct.
+
+If the link names differ from the Panda's, change the `"k_ee_link"` and `"panda_link0"` lookups at lines 294, 295 and 414. Then print what IsaacGym loaded:
+
+```python
+gym = env.isaac_gym
+print(gym.get_asset_dof_names(env.franka_asset))          # arm joints first, the 2 fingers last
+print(gym.get_asset_rigid_body_dict(env.franka_asset))    # must contain k_ee_link and the base link
+print(gym.get_asset_dof_properties(env.franka_asset)["lower"])
+```
+
+The Panda prints `panda_joint1 … panda_joint7, panda_finger_joint1, panda_finger_joint2`.
+
+#### Step 3. Remove the hard-coded 7 and 9 (arms without 7 joints only)
+
+Define the arm size once, right after the asset is loaded:
+
+```python
+self.n_arm_dofs = self.isaac_gym.get_asset_dof_count(self.franka_asset) - 2
+```
+
+Then replace the constants at every line listed under *DOF layout* above:
+- `[:7]` → `[:self.n_arm_dofs]` and `[7:]` → `[self.n_arm_dofs:]`.
+- `view(self.num_envs, 9)` → `view(self.num_envs, self.n_arm_dofs + 2)`.
+- `7:9` → `self.n_arm_dofs:self.n_arm_dofs + 2`.
+- `dof_pos[:, 7:8]` / `8:9` → `self.n_arm_dofs` / `self.n_arm_dofs + 1`.
+- `torch.rand((len(env_idxs), 7)` in `_reset_frankas` → `self.n_arm_dofs`.
+- The Jacobian slice `[:, self.franka_ee_index - 1, :, :7]` → `:self.n_arm_dofs`. The `- 1` stays: a fixed base has no Jacobian row.
+
+`reset_joints` then needs `n_arm_dofs` values, and the pickles' `joint_positions` will have `n_arm_dofs` entries. `process_pickles` drops joint data, so the zarrs and policies are unaffected.
+
+A 6-joint arm has no redundancy. Diff-IK's `lstsq` still works, but it moves the arm harshly near singularities, so check that the task workspace stays clear of them (Step 7).
+
+#### Step 4. Place the base and choose the home pose
+
+1. **Base position.** Mount the new robot's base where it sits relative to the table on the real setup. If that differs from the Panda's `(-0.3, 0, 0.415)` (line 283), also update `base_tag_xyz` / `tag_base_from_robot_base` in [config.py](../furniture-bench/furniture_bench/config.py), which map between the AprilTag (part) frame and the robot frame. Keep the base **unrotated**: `get_ee_pose` doesn't apply the base rotation.
+2. **Home joints.** Start the new robot with its fingertip where the Panda's starts, so demos begin from the same state distribution. Measured in this env (`one_leg`, robot base frame), the Panda's home tip pose is:
+   ```
+   pos       [0.5673, 0.0554, 0.1239]
+   quat xyzw [0.8933, 0.4494, -0.0080, 0.0027]
+   ```
+   Set `reset_joints` to a rough guess for the new arm, then let diff-IK drive the fingertip there and read off the joints:
+   ```python
+   import isaacgym, torch
+   from src.gym import get_rl_env
+   env = get_rl_env(0, task="one_leg", randomness="low", observation_space="state",
+                    act_rot_repr="quat", action_type="pos", headless=True)
+   env.franka_joint_rand_lim_deg = 0.0      # no reset noise
+   env.reset()
+   target = torch.tensor([[0.5673, 0.0554, 0.1239, 0.8933, 0.4494, -0.0080, 0.0027, -1.0]],
+                         device=env.device)  # absolute pose + gripper open
+   for _ in range(50):
+       env.step(target)
+   print(env.get_ee_pose())                                # should match the target
+   print(env.dof_pos[0, :-2].tolist())                     # new reset_joints
+   ```
+   Starting from a 5.8 cm offset, this converged on the Panda to within 0.001 cm. Put the printed joints into `reset_joints`. Check that every joint has a margin from its limits: the reset adds ±5° / ±10° / ±13° of noise (`low` / `med` / `high`), and screwing needs wrist-roll range in both directions.
+
+`reset_joints` lives in the shared `config["robot"]`, which the real FurnitureBench env also reads. Keep a copy of the Panda values if you still use that env.
+
+#### Step 5. Configure the gripper
+
+| Setting | Where | What to set |
+|---|---|---|
+| `max_gripper_width[task]` | [config.py:37](../furniture-bench/furniture_bench/config.py#L37) | Open width used for this task, within the new stroke. Each finger is limited to half of it (line 441) |
+| `gripper_torque`, `gripper_frictions` | [sim_config.py:59-77](../furniture-bench/furniture_bench/sim_config.py#L59-L77) | Finger force and joint friction. Tune until a grasped leg doesn't slip while being screwed in |
+| "Open" thresholds `>= 0.06` and `>= 0.05` | [data_collector_sm.py:472](../src/data_collection/data_collector_sm.py#L472), [:550](../src/data_collection/data_collector_sm.py#L550) | Scale with the new open width (about 92% and 77% of it) |
+| Finger friction in the URDF / part friction | URDF, `sim_config["parts"]` | Pad material. Leave the parts' friction alone so tasks stay comparable |
+
+#### Step 6. Match the controller and cameras
+
+- **Arm drive gains.** Stiffness 1000 and damping 200 (lines 118-119) were set for the Panda's link masses. Heavier arms track the 10 Hz targets with more lag. Change the defaults at lines 118-119 until the tracking test in Step 7 tracks like the Panda. Passing `stiffness=` / `damping=` through `get_rl_env` has no effect: it doesn't forward extra keyword arguments to the env.
+- **Wrist camera.** Move the mount at lines 647-658 to where the camera sits on the real robot, measured from `k_ee_link`. This changes only image observations and doesn't affect state-based BC or RL.
+- **Front camera** (line 661) is fixed in the world. Leave it unless the real camera moves.
+
+#### Step 7. Check before collecting
+
+Run these with `RESIP_ROBOT_URDF` (and `RESIP_ROBOT_FLIP_VISUALS`) set and `LD_LIBRARY_PATH` exported (§9.1):
+
+| Check | How | Pass criterion |
+|---|---|---|
+| Loads | Step 2 prints | DOF order arm → fingers; `k_ee_link` found |
+| Looks right | `python -m src.data_collection.teleop --furniture one_leg --randomness low --ctrl-mode diffik --num-demos 1` | Visual and collision meshes line up; the red laser starts between the fingertips and points out of the gripper |
+| Home pose | Reset several times at `med` | The fingertip starts above the table in the Panda's orientation; no joint starts at a limit |
+| Tracking | Command +2 cm steps in x, y and z, and a 90° wrist roll, with `env.step` as in Step 4 | Reaches each target within a few steps, no oscillation; compare with the same test on the Panda |
+| Grasp | Teleop: grasp the leg, lift it, roll it 90° | The leg doesn't slip or spin in the fingers |
+| Full demo | Teleop a complete `one_leg` | `Part assembled!` is printed, without hitting joint limits |
+| Replay | `python scripts/replay_in_sim.py <new pickle>` (§9.3) | EE tracking error similar to the Panda's (~0.1 cm mean) |
+
+#### Step 8. Collect and use the data
+
+- **Keep the new robot's data apart.** The path grammar (§2) has no robot level, so use separate roots, e.g. `export DATA_DIR_RAW=$HOME/ResiP/data_<robot>` and `DATA_DIR_PROCESSED` to the same. Then collect (§10.2) and process (§5) as usual.
+- **Don't mix in the released Panda demos** unless the gripper, base placement and reach are the same. For an FR3, the Panda demos that stay within FR3 limits can be kept. Check each pickle's `observations[t]["robot_state"]["joint_positions"]` against the limits and drop the ones that leave them.
+- **RL and evaluation follow automatically.** `residual_ppo.py` and `evaluate_model.py` build the same env class, so with `RESIP_ROBOT_URDF` set they train and evaluate on the new robot. Set it in every shell and slurm script; a π_base trained on one robot and evaluated on another fails silently.
+- **Not covered here:**
+  - **Re-rendering.** [isaac_lab_rerender.py:701-711](../src/sim2real/isaac_lab_rerender.py#L701-L711) poses Isaac Lab's `FRANKA_PANDA_CFG` from the recorded `joint_positions` and mounts the wrist camera on `panda_hand`. A new robot needs its own Isaac Lab articulation config (USD) and camera prim there.
+  - **Real-robot scripts.** `src/real/` still assumes the Franka tip offset and gripper API.
 
 ---
 

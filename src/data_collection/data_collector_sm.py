@@ -28,6 +28,9 @@ from src.visualization.render_mp4 import pickle_data, unpickle_data
 from src.data_collection.collect_enum import CollectEnum
 
 import time
+import ctypes
+import os
+import signal
 from multiprocessing.managers import SharedMemoryManager
 
 import numpy as np
@@ -47,6 +50,33 @@ def precise_wait(t_end: float, slack_time: float = 0.001, time_func=time.monoton
         while time_func() < t_end:
             pass
     return
+
+
+def die_with_parent(parent_pid: int):
+    """Make the calling (child) process get killed as soon as its parent dies.
+
+    The SpaceMouse reader and the shared-memory server are forked after IsaacGym has
+    initialized CUDA, so each holds a copy of the parent's GPU memory. If the collector
+    dies without leaving its `with` blocks (crash, closed terminal, second Ctrl-C during
+    teardown), they would otherwise keep running and keep that memory.
+    """
+    PR_SET_PDEATHSIG = 1
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    # The parent may have died before prctl took effect.
+    if os.getppid() != parent_pid:
+        os._exit(0)
+
+
+class ParentBoundSpacemouse(Spacemouse):
+    """Spacemouse reader process that exits together with the process that started it."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parent_pid = os.getpid()
+
+    def run(self):
+        die_with_parent(self.parent_pid)
+        super().run()
 
 
 class DataCollectorSpaceMouse:
@@ -222,7 +252,9 @@ class DataCollectorSpaceMouse:
         args.deadzone = 0.05
         if self.env.ctrl_mode == "diffik":
             args.max_pos_speed = 0.15  # 0.8
-            args.max_rot_speed = 0.3  # 3.0
+            # Per-axis max rotation speed (rad/s, before sm_drot_scalar), about the robot
+            # base frame's x (toward the operator), y (right) and z (vertical, cap twist).
+            args.max_rot_speed = np.array([0.2, 0.2, 0.6])  # 3.0
         else:
             args.max_pos_speed = 0.8
             # args.max_rot_speed = 2.5
@@ -240,7 +272,7 @@ class DataCollectorSpaceMouse:
         self.metadata["command_latency"] = command_latency
         self.metadata["deadzone"] = args.deadzone
         self.metadata["max_pos_speed"] = args.max_pos_speed
-        self.metadata["max_rot_speed"] = args.max_rot_speed
+        self.metadata["max_rot_speed"] = np.broadcast_to(args.max_rot_speed, 3).tolist()
         self.metadata["sm_dpos_scalar"] = self.sm_dpos_scalar.tolist()
         self.metadata["sm_drot_scalar"] = self.sm_drot_scalar.tolist()
 
@@ -287,8 +319,11 @@ class DataCollectorSpaceMouse:
         ready_to_grasp = True
         steps_since_grasp = 0
 
-        with SharedMemoryManager() as shm_manager:
-            with Spacemouse(shm_manager=shm_manager, deadzone=(0.05, 0.05, 0.05, 0.3, 0.05, 0.3)) as sm:
+        # Both helper processes are bound to this one, so they can't outlive it (see die_with_parent).
+        shm_manager = SharedMemoryManager()
+        shm_manager.start(die_with_parent, (os.getpid(),))
+        with shm_manager:
+            with ParentBoundSpacemouse(shm_manager=shm_manager, deadzone=(0.4, 0.4, 0.4, 0.9, 0.15, 0.9)) as sm:
                 t_start = time.monotonic()
 
                 prev_keyboard_gripper = -1
