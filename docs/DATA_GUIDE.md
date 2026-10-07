@@ -714,7 +714,7 @@ The repo has three collectors. Only the SpaceMouse simulation collector was used
 
 | Collector | Command | Environment | Status |
 |---|---|---|---|
-| **Simulation, SpaceMouse** (+ keyboard) | `python -m src.data_collection.teleop` ([teleop.py](../src/data_collection/teleop.py) → [data_collector_sm.py](../src/data_collection/data_collector_sm.py)) | `FurnitureRLSimEnv`, the same env as RL and evaluation | Used for the released demos (since 2024-05-15). Not run on this machine yet |
+| **Simulation, SpaceMouse** (+ keyboard) | `python -m src.data_collection.teleop` ([teleop.py](../src/data_collection/teleop.py) → [data_collector_sm.py](../src/data_collection/data_collector_sm.py)) | `FurnitureRLSimEnv`, the same env as RL and evaluation | Used for the released demos (since 2024-05-15). Starts on this machine (2026-10-07) |
 | Simulation, scripted | `python -m src.data_collection.scripted` ([scripted.py](../src/data_collection/scripted.py)) | Original `FurnitureSimEnv`, OSC controller, FurnitureBench's hard-coded assembly script | **Doesn't start as written**: it calls `trajectory_save_dir(environment=…)` without `controller`, which don't match the function's arguments (§10.7) |
 | Real robot, SpaceMouse | `python -m src.real.teleop_sm` ([teleop_sm.py](../src/real/teleop_sm.py)) | Franka + two RealSense cameras | Needs the authors' internal `rdt` package (§10.7) |
 
@@ -774,12 +774,46 @@ python -m src.data_collection.teleop --furniture one_leg --randomness low --ctrl
 
 There is no quit key: the run ends after `--num-demos` successes, or stop it with Ctrl-C. Keys `r` and the digits are read by the keyboard interface but ignored by this collector.
 
+- **`INFO: Reward pressed: N` is harmless.** The shared keyboard interface logs every digit key as a manual reward label ([keyboard_interface.py:74-77](../src/data_collection/keyboard_interface.py#L74-L77)). Only the older `DataCollector` ([data_collector.py:213-219](../src/data_collection/data_collector.py#L213-L219)) acts on it, for real-robot runs where nothing detects assembly automatically. `teleop` uses `DataCollectorSpaceMouse`, which never reads it, so the recorded rewards don't change.
+- **`pynput` hears keys typed in any window,** not just the viewer or terminal. Typing elsewhere while the collector runs can move the arm or trigger `t`/`n`/`b`.
+
 **One episode:**
 1. The scene resets to a new random layout. **Press Enter** in the terminal to start.
 2. Wait about 2 s for the robot to settle; nothing is recorded before that.
 3. Teleoperate the task. For `one_leg`: push the tabletop into the corner of the fixture, pick up the leg, insert it into a hole and screw it in.
-4. Keep screwing until the terminal prints **`Part assembled!`**. That is the simulator's success check firing: the leg within 5 mm of fully seated, and its twist within about ±20° of its tightened angle.
+4. Keep screwing until the terminal prints **`Part assembled!`**. That is the simulator's success check firing: the leg within 5 mm of fully seated, and its twist within about ±20° of its tightened angle (details below).
 5. Release the leg, move away, and press **`t`**.
+
+#### What counts as assembled
+
+There is no separate written standard: the paper counts an episode as a success when the simulator reports the parts assembled, so the thresholds below *are* the standard. The same check ([furniture_rl_sim_env.py:1971-2034](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1971-L2034), `_reward`) runs during teleop, RL training and evaluation.
+
+After every step, for each pair of parts the task must assemble:
+
+1. **Relative pose.** Express the second part's pose in the first part's frame: `rel_pose = inv(T_part1) @ T_part2`. For `one_leg` that is the leg (part 4) in the tabletop's (part 0) frame.
+2. **Compare to the seated poses.** Each pair has a list of target relative poses, and matching **any** of them counts. For the square table there are four, one per corner hole: the leg at `(±56.25 mm, 46.875 mm, ±56.25 mm)` from the tabletop centre, with no rotation ([square_table.py:25-34](../furniture-bench/furniture_bench/furniture/square_table.py#L25-L34)). The tabletop's y axis is its normal, i.e. the leg's axis.
+3. **Position tolerance**, per axis in the first part's frame ([config.py:98-102](../furniture-bench/furniture_bench/config.py#L98-L102), `assembled_pos_threshold`):
+
+   | Axis | Tolerance | For `one_leg` |
+   |---|---|---|
+   | x | 10 mm | sideways from the hole centre |
+   | y | **5 mm** | along the leg: how far it is screwed in |
+   | z | 10 mm | sideways from the hole centre |
+
+4. **Rotation tolerance.** Each of the three axes of the relative rotation must have cosine similarity ≥ `ori_bound = 0.94` with the target's axis ([furniture.py:30](../furniture-bench/furniture_bench/furniture/furniture.py#L30); comparison in `is_similar_rot`, [control_utils.py:979-981](../furniture-bench/furniture_bench/controllers/control_utils.py#L979-L981)). That is about **±20°** per axis, which in practice means screwing until the leg's twist is near its tightened angle. Pairs listed in a furniture's `position_only` skip this test (none for `one_leg`).
+5. **Reward and success.** A pair that passes both tests for the first time gives reward 1 on that step and is added to `already_assembled`. The episode succeeds when every pair is assembled.
+
+| Task | Pairs to assemble ([furniture_rl_sim_env.py:1883-1900](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1883-L1900)) |
+|---|---|
+| `one_leg` | `(0, 4)`: tabletop + leg 4 |
+| `square_table` | `(0, 1)`, `(0, 2)`, `(0, 3)`, `(0, 4)` |
+| `lamp` | `(0, 1)`, `(0, 2)` |
+| `round_table` | `(0, 1)`, `(1, 2)` |
+| `mug_rack`, `factory_peg_hole`, `factory_nut_bolt` | `(0, 1)` |
+
+- **It only fires once per pair.** `already_assembled` is cleared only on reset, so if the leg loosens again afterwards the episode stays a success, and `Part assembled!` isn't printed again.
+- **In teleop the check only reports.** With `manual_done=True` the env prints `Part assembled!` instead of returning the reward and never ends the episode (§10.5), so pressing `t` before the message still saves the demo as a success.
+- **The original `FurnitureSimEnv`** (used by `scripted.py`) runs the same test through `Furniture.compute_assemble` / `is_assembled_idx` ([furniture.py:348-470](../furniture-bench/furniture_bench/furniture/furniture.py#L348-L470)) with the same thresholds.
 
 ### 10.4 Collecting good demos
 

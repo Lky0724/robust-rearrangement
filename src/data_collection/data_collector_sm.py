@@ -323,7 +323,7 @@ class DataCollectorSpaceMouse:
         shm_manager = SharedMemoryManager()
         shm_manager.start(die_with_parent, (os.getpid(),))
         with shm_manager:
-            with ParentBoundSpacemouse(shm_manager=shm_manager, deadzone=(0.4, 0.4, 0.4, 0.9, 0.15, 0.9)) as sm:
+            with ParentBoundSpacemouse(shm_manager=shm_manager, deadzone=(0.4, 0.4, 0.4, 0.8, 0.15, 0.8)) as sm:
                 t_start = time.monotonic()
 
                 prev_keyboard_gripper = -1
