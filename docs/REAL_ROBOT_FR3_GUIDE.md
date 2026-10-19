@@ -1,29 +1,145 @@
 # Real-Robot Guide: Franka Research 3
 
-How to run stage 4 (teleop collection of D_real) and stage 5b (π_real rollout) of the ResiP pipeline on a **Franka Research 3 (FR3)**. The authors used a Franka **Panda** with Polymetis and their lab-internal `rdt` package, so the robot layer has to be replaced. The policy, data format and processing stay the same.
+How to run stage 4 (teleop collection of D_real) and stage 5b (π_real rollout) of the ResiP pipeline on a **Franka Research 3 (FR3)**. The authors used a Franka **Panda** with Polymetis and their `rdt` tools; Polymetis doesn't support the FR3 out of the box, so this guide replaces the robot layer. To first try the original stack on the FR3 unchanged, see [FR3_ORIGINAL_CODE_TELEOP_TEST.md](FR3_ORIGINAL_CODE_TELEOP_TEST.md). The policy, data format and processing stay the same.
 
-§1–7 explain the setup and why each change is needed. **§8 is the step-by-step procedure**, from code changes to a real rollout.
+**§1 is the big picture:** a diagram of how the original code drives the robot, the same diagram for the FR3 plan, and a comparison of what to change. §2–7 give the details. **§8 is the step-by-step procedure**, from code changes to a real rollout.
 
 Related docs: [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) (stages 4–5), [DATA_AND_POLICY_IO.md](DATA_AND_POLICY_IO.md) (pickle/zarr fields), [DATA_GUIDE.md](DATA_GUIDE.md) (visualizing demos).
 
 ---
 
-## 1. How the original code drives the robot
+## 1. Workflow: original code vs. the FR3 plan
 
-The paper (Sec. III-B) gives the control stack. The code in [src/real/](../src/real/) implements it like this:
+### 1.1 How the original code drives the Panda
+
+The paper (Sec. III-B) describes the stack: 10 Hz target end-effector poses → differential IK → joint targets → a 1 kHz PD (joint impedance) controller. Teleop and rollout share everything below the script layer.
 
 ```
-policy / SpaceMouse (10 Hz)
-   │  target fingertip pose T_des ∈ SE(3) + gripper command
-   ▼
-convert_tip2wrist          tip frame → Franka flange frame
-   ▼
-update_desired_ee_pose     differential IK → joint position target q*
-   ▼
-joint impedance @ 1 kHz    τ = Kq (q* − q) − Kqd q̇      (Polymetis server, via libfranka/FCI)
-   ▼
-Franka arm + Franka Hand
+ ═══ COMMAND PATH ═════════════════════════════════════════════════════════════════════════════════
+
+        TELEOP (collect D_real)                            ROLLOUT (run π_real)
+  SpaceMouse ─► rdt.spacemouse.Spacemouse          WandB run ─► src/behavior (get_actor), weights
+  keyboard   ─► rdt.common.KeyboardInterface       obs ─► actor.action(obs)  →  [xyz, rot6d, grip]
+              │ (success/fail keys, screw rotation)            │ (absolute TIP pose, action chunks)
+              ▼                                                ▼
+  src/real/teleop_sm.py                            src/real/minimal.py
+    ObsActHelper.get_action():                       SimpleDiffIKFrankaEnv.step():
+      integrate SpaceMouse Δ → target TIP pose         action2pose_mat → target TIP pose
+      gripper button → toggle                          sign flip of grip → toggle (+1.5 s sleep)
+    main loop: precise_wait → strict 10 Hz           main loop: inference time + sleep(0.025) ≈ 10 Hz
+              └──────────────────────────┬─────────────────────┘
+                                         ▼
+  convert_tip2wrist()  (defined in both scripts)       TIP pose → FLANGE pose (0.1034 m, 45° about z)
+                                         ▼
+  rdt.polymetis_robot_utils.interfaces.diffik.DiffIKWrapper   (subclass of polymetis.RobotInterface)
+    move_to_joint_positions(home) → start_joint_impedance(Kq, Kqd) → update_desired_ee_pose(T, dt)
+    diff-IK: q* = q + J⁺·e, ONCE per 10 Hz command, client side → update_desired_joint_positions(q*)
+  polymetis.GripperInterface: grasp(speed, force) / goto(width, speed, force)
+                                         │ gRPC to the Polymetis server at 173.16.0.1
+                                         ▼
+  Polymetis server (fairo fork, libfranka 0.9.2 — furniture-bench/docker/server.Dockerfile)
+    joint impedance @ 1 kHz:  τ = Kq (q* − q) − Kqd q̇      runs on a real-time-kernel machine
+                                         │ FCI (libfranka, 1 kHz)
+                                         ▼
+  Franka Panda + Franka Hand
+
+ ═══ SENSING PATH (back into the scripts each step) ═════════════════════════════════════════════════
+
+  2× RealSense D435 ─► pyrealsense2 + rdt.image.factory / rdt.config      (serials: src/real/serials.py)
+                     ─► color_image1 = wrist, color_image2 = front  (minimal.py: resize / resize_crop)
+  Polymetis state    ─► RobotInterface.get_ee_pose / get_joint_positions / get_joint_velocities
+                        / robot_model.compute_jacobian ─► rdt PolymetisHelper ─► convert_wrist2tip()
+                     ─► robot_state: tip pos, quat xyzw, (EE velocity = J·q̇), gripper width
+  meshcat            ◄─ rdt.common.mc_util.meshcat_frame_show (target / current frames)
+
+ ═══ OUTPUT ═══════════════════════════════════════════════════════════════════════════════════════
+
+  teleop:  <save_dir>/<timestamp>.pkl ─► src/data_processing/process_pickles.py -d real ─► D_real .zarr
+  rollout: robot motion; optional --log-ci pickles (CollectInferHelper in minimal.py)
 ```
+
+### 1.2 How the code should drive the FR3 (our plan)
+
+The same structure, with the robot layer swapped out. Labels: **[same]** unchanged, **[edit]** small edit, **[new]** new file, **[swap]** existing in-repo module replacing an `rdt` one.
+
+```
+ ═══ COMMAND PATH ═════════════════════════════════════════════════════════════════════════════════
+
+        TELEOP (collect D_real)                            ROLLOUT (run π_real)
+  SpaceMouse ─► furniture_bench/device/spacemouse/  WandB run ─► src/behavior (get_actor)   [same]
+                spacemouse_shared_memory.py  [swap]  obs ─► actor.action(obs)                [same]
+  keyboard   ─► src/data_collection/keyboard_interface.py + collect_enum.py   [swap + edit: RECORD]
+              ▼                                                ▼
+  src/real/teleop_sm.py              [edit]        src/real/minimal.py                     [edit]
+    imports + server IP only;                        imports + server IP + PAUSE_HOLD→PAUSE;
+    control logic unchanged                          optional: restore strict 10 Hz
+              └──────────────────────────┬─────────────────────┘
+                                         ▼
+  convert_tip2wrist()                                                                       [same]
+                                         ▼
+  src/real/fr3/client.py                                                                     [new]
+    FR3Robot   (imported as DiffIKWrapper):    same methods; update_desired_ee_pose → "set_target"
+    FR3Gripper (imported as GripperInterface): grasp / goto → "grasp" / "move_gripper"
+                                         │ zmq REQ/REP over LAN, 10 Hz (target pose ↓, state ↑)
+                                         ▼
+  src/real/fr3/server.py   on the real-time control PC                                       [new]
+    diff-IK loop ~500 Hz toward the latest target
+      (same formula as furniture-bench/furniture_bench/controllers/diffik.py, clamped per tick)
+    panda-py controllers.JointPosition(Kq, Kqd): joint impedance @ 1 kHz
+    libfranka.Gripper (calls run in a thread; they block)
+                                         │ FCI (libfranka ≥ 0.10, matched to the FR3 system version)
+                                         ▼
+  Franka Research 3 + Franka Hand
+
+ ═══ SENSING PATH ═════════════════════════════════════════════════════════════════════════════════
+
+  2× RealSense D435 ─► src/real/fr3/realsense.py                                            [new]
+                       (serials: src/real/serials.py [edit]) ─► color_image1 / color_image2 [same]
+  server "state"     ─► libfranka Model: FLANGE pose + Jacobian, q, q̇, gripper width       [new]
+                     ─► FR3Robot getters ─► src/real/fr3/utils.py PolymetisHelper [new]
+                     ─► convert_wrist2tip() ─► robot_state                                   [same]
+  meshcat            ◄─ src/real/fr3/utils.py meshcat_frame_show                             [new]
+
+ ═══ OUTPUT ═══════════════════════════════════════════════════════════════════════════════════════
+
+  identical: same pickle format ─► process_pickles.py ─► D_real .zarr                       [same]
+```
+
+### 1.3 Comparison and what to modify
+
+| Layer | Original (Panda) | FR3 plan | Change | Where in §8 |
+|---|---|---|---|---|
+| SpaceMouse reader | `rdt.spacemouse.Spacemouse` | `furniture_bench/device/spacemouse/spacemouse_shared_memory.py` (same class, same constructor) | import swap | Step 5 |
+| Keyboard + episode keys | `rdt.common.KeyboardInterface`, `rdt...CollectEnum` | `src/data_collection/keyboard_interface.py`, `collect_enum.py` | import swap; add `RECORD`, use `PAUSE` | Step 5 |
+| Teleop script | `teleop_sm.py` | same file | imports + `franka_ip` → server IP | Step 5 |
+| Rollout script | `minimal.py` | same file | imports (both blocks), `franka_ip`, `PAUSE_HOLD`; optional 10 Hz fix | Step 5 |
+| Policy, normalizer, WandB loading | `src/behavior`, WandB | same | none | — |
+| Tip ↔ flange frames | `convert_tip2wrist` / `convert_wrist2tip` | same | none (FR3 shares Panda kinematics and the Franka Hand) | — |
+| Robot client API | `DiffIKWrapper` (rdt) on `polymetis.RobotInterface` | `FR3Robot` in `src/real/fr3/client.py` with the same method names | **new file** | Step 4 |
+| Gripper client API | `polymetis.GripperInterface` | `FR3Gripper` in `client.py` | **new file** | Step 4 |
+| Transport | gRPC (Polymetis) | zmq REQ/REP | new | Steps 3–4 |
+| Diff-IK | `rdt` `DiffIKWrapper` (`lars-dev`): sim formula, evaluated **once per 10 Hz command** on the client | in `server.py`: same formula, ~500 Hz (like the sim's per-substep update), or once per command to replicate the original | **new** | Step 3 |
+| Low-level controller | Polymetis joint impedance @ 1 kHz, `Kq`/`Kqd` | panda-py `JointPosition(stiffness=Kq, damping=Kqd)` @ 1 kHz | new; same gains to start, retune | Steps 3, 8 |
+| FCI library | libfranka 0.9.2 (Panda only) | libfranka ≥ 0.10, matched to the FR3 system version | upgrade | Step 1 |
+| Control machine | Polymetis server on a real-time machine | `server.py` on a PREEMPT_RT PC | new setup | Steps 1–2 |
+| Cameras | pyrealsense2 via `rdt.image` / `rdt.config` | `src/real/fr3/realsense.py` | **new file**; set serials | Steps 4–5 |
+| Pose / meshcat helpers | `rdt` `PolymetisHelper`, `mc_util` | `src/real/fr3/utils.py` | **new file** | Step 4 |
+| Data format and processing | pickle → `process_pickles.py` → zarr | same | none | — |
+| Python env | Polymetis conda env (py3.8, torch 1.13) | repo training env + pyrealsense2, meshcat, pynput, pyzmq, spnav; no Polymetis | new env | Step 6 |
+| Sim cameras for D_synth | authors' intrinsics and poses in `isaac_lab_rerender.py` | your intrinsics and poses | edit | Steps 7, 10 |
+
+**What to modify, in short:**
+- **Write 4 new files** in `src/real/fr3/`: `server.py` (runs on the control PC; diff-IK + 1 kHz impedance + gripper via panda-py), `client.py` (Polymetis-compatible `FR3Robot` / `FR3Gripper`), `realsense.py`, `utils.py`.
+- **Edit 6 existing files**:
+  - `teleop_sm.py` and `minimal.py`: imports, IP and the pause key.
+  - `collect_enum.py` and `keyboard_interface.py`: the `RECORD` key.
+  - `serials.py`: your camera serials.
+  - `isaac_lab_rerender.py`: your cameras.
+- **Leave everything else alone:** the control logic in both scripts, the frame conversions, the action and observation format, `process_pickles.py`, and training.
+
+The one place behavior can differ is **diff-IK and gains**. The original `DiffIKWrapper` uses the same formula as the sim, but evaluates it once per 10 Hz command, after which the impedance controller holds that fixed `q*`. The sim re-evaluates it at every substep. Recomputing at a high rate (the plan's default) tracks more like the sim. Evaluating once per command (set the server loop to act only on a new target) replicates the authors' real robot. Either way, use the **same** setting for teleop and rollout, and check tracking with the sim-replay test (Step 8e).
+
+### 1.4 Original control parameters
 
 | Piece | Where | Value |
 |---|---|---|
@@ -44,7 +160,7 @@ q̇*   = lstsq(J, [e_pos; e_rot] / 0.1)                  # pos_scalar = rot_scal
 q*    = q + q̇* · 0.1
 ```
 
-The sim **recomputes this at every physics substep** toward the same goal. An IsaacGym position drive then tracks `q*` with stiffness 1000 and damping 200. On the real robot, recompute diff-IK inside the control loop (1 kHz, or at least ~100 Hz) toward the latest 10 Hz target. Computing it only once per 10 Hz command tracks differently.
+The sim **recomputes this at every physics substep** toward the same goal. An IsaacGym position drive then tracks `q*` with stiffness 1000 and damping 200. The authors' real robot (`rdt` `DiffIKWrapper`) evaluated it only **once per 10 Hz command** (`q* = q + J⁺·e`, with `dt` cancelling) and let joint impedance hold `q*`. For tracking closer to sim, recompute it at a high rate toward the latest target; to replicate the original, evaluate once per command.
 
 ---
 
@@ -52,7 +168,7 @@ The sim **recomputes this at every physics substep** toward the same goal. An Is
 
 1. **libfranka is too old.** The repo pins libfranka **0.9.2** ([server.Dockerfile](../furniture-bench/docker/server.Dockerfile), Polymetis fork `minoring/fairo@furniture`). FR3 needs libfranka **≥ 0.10**, and newer FR3 system versions need newer releases. Check Franka's compatibility matrix for your system version.
 2. **Polymetis is no longer maintained.** It can be rebuilt against a newer libfranka, but the API changed after 0.9, so expect to patch it.
-3. **`rdt` is lab-internal.** `rdt` means "real deployment tools", from MIT's Improbable AI lab ([src/real/readme.md](../src/real/readme.md) links `github.com/anthonysimeonov/improbable_rdt`). ⚠️ [setup.txt](../src/real/setup.txt) says `pip install rdt`, but `rdt` on PyPI appears to be an unrelated package (SDV's Reversible Data Transforms). Don't install it.
+3. **`rdt` lives in a separate repo.** `rdt` means "real deployment tools", from MIT's Improbable AI lab: `github.com/anthonysimeonov/improbable_rdt`. It's public, but only its **`lars-dev`** branch has every module the scripts import. ⚠️ [setup.txt](../src/real/setup.txt) says `pip install rdt`, but `rdt` on PyPI is an unrelated package (SDV's Reversible Data Transforms). Don't install it. You can keep using `rdt`'s SpaceMouse, keyboard and camera helpers with this plan; only `DiffIKWrapper` has to go, because it is built on Polymetis.
 
 **FCI is required either way.** The Franka Control Interface (FCI) is the only route to 1 kHz external control, and Polymetis itself is an FCI client. The only decision is which FCI client sits on top of it.
 
@@ -83,7 +199,7 @@ The sim **recomputes this at every physics substep** toward the same goal. An Is
 
 ### 3.3 Adapter interface
 
-Write one module (e.g. `src/real/fr3_interface.py`) that exposes what [teleop_sm.py](../src/real/teleop_sm.py) and [minimal.py](../src/real/minimal.py) call, so both scripts only change their imports:
+The client classes in `src/real/fr3/client.py` (code in §8 Step 4) expose what [teleop_sm.py](../src/real/teleop_sm.py) and [minimal.py](../src/real/minimal.py) call, so both scripts only change their imports:
 
 ```python
 class FR3Robot:
@@ -93,17 +209,17 @@ class FR3Robot:
     robot_model.compute_jacobian(q) -> Tensor             # (6, 7), flange frame, base coords
     def move_to_joint_positions(self, q: Tensor)          # blocking, smooth
     def start_joint_impedance(self, Kq, Kqd, adaptive=True)
-    def update_desired_ee_pose(self, pose_mat, dt=0.1)    # flange target → diff-IK (§1) → q*
+    def update_desired_ee_pose(self, pose_mat, dt=0.1)    # flange target → diff-IK (§1.4) → q*
 
 class FR3Gripper:
     def grasp(self, speed, force, blocking=False)        # Polymetis order: close until contact
     def goto(self, width, speed, force, blocking=False)
-    def get_state(self) -> obj with .width, .is_moving
+    def get_state(self) -> obj with .width
 ```
 
 Keep these unchanged, or real data stops matching sim:
 - **Frames:** policy and pickle poses are **fingertip** poses. Keep `convert_tip2wrist` / `convert_wrist2tip` as they are. FR3 has the same kinematic (DH) parameters and the same Franka Hand as the Panda, so the offset and the sim model still apply.
-- **Diff-IK:** the same error terms as the sim controller (§1), recomputed at a high rate. Use damped least squares if you get near singularities.
+- **Diff-IK:** the same error terms as the sim controller (§1.4), recomputed at a high rate. Use damped least squares if you get near singularities.
 - **Per-step clamp:** limit `‖q* − q‖` per control tick, or interpolate the target, so 10 Hz target jumps don't trip FR3 reflexes.
 
 ---
@@ -271,7 +387,7 @@ Code blocks in steps 3–4 are **sketches**: the panda-py / libfranka binding na
 
 ### Step 3. Write the FR3 server (RT PC)
 
-Create `src/real/fr3/server.py`. It owns the robot and the gripper, runs diff-IK toward the latest target at a high rate (§1), and answers a few commands over zmq.
+Create `src/real/fr3/server.py`. It owns the robot and the gripper, runs diff-IK toward the latest target at a high rate (§1.4), and answers a few commands over zmq.
 
 ```python
 # src/real/fr3/server.py — runs on the RT PC
@@ -440,7 +556,7 @@ def get_default_multi_realsense_cfg():
 def enable_single_realsense(serial, ctx, width, height, fps):
     cfg = rs.config()
     cfg.enable_device(serial)
-    cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)  # RGB order, see §9
+    cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)  # rgb8, as rdt used
     cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)   # scripts align depth
     pipe = rs.pipeline(ctx)
     pipe.start(cfg)
@@ -531,7 +647,7 @@ Start the server on the RT PC (`python -m src.real.fr3.server`), then run short 
    ```bash
    python -m src.data_processing.process_pickles -c diffik -d real -f one_leg_real -s teleop -r low -o success
    ```
-   Check the camera order, the colors (§9), and that actions are small and smooth. Use the viewers in [DATA_GUIDE.md](DATA_GUIDE.md) §9.
+   Check the camera order, that the colors look natural, and that actions are small and smooth. Use the viewers in [DATA_GUIDE.md](DATA_GUIDE.md) §9.
 3. Collect 10–40 demos, varying the initial part poses as in the evaluation grid. Re-process at the end and run the coverage check (§6).
 
 ### Step 10. Build D_synth with your cameras and co-train
@@ -552,7 +668,6 @@ Start the server on the RT PC (`python -m src.real.fr3.server`), then run short 
 
 These come from reading the code and general Franka knowledge. Check them on your setup:
 - The minimum libfranka version for your FR3 system version, and whether your chosen client (e.g. panda-py) has a build for it.
-- What `rdt`'s `DiffIKWrapper` does internally (rate, damping, clamping). It isn't in this repo. §1 describes the sim controller, which is the target to match.
 - That the home pose is inside FR3 joint limits.
 - The exact panda-py / libfranka binding names used in the Step 3 sketch (`create_context`, `controllers.JointPosition(stiffness, damping)`, `get_model().pose / zero_jacobian`, `Gripper.grasp / move / read_once`), and whether `read_once()` is safe while a blocking gripper command runs in another thread. If it isn't, cache the gripper state in a background thread.
-- **Color channel order.** It isn't known whether `rdt` stored RGB or BGR. The sim renders RGB. Open one of the authors' real zarrs from the S3 bucket and one of your frames with matplotlib: if the colors in theirs look natural, they stored RGB, and you should keep `rs.format.rgb8`.
+- Resolved: `rdt` streams color as **rgb8** (`lars-dev` `image/factory.py`), matching the sim, and its `DiffIKWrapper` evaluates diff-IK once per command (§1.4).
