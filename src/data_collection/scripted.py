@@ -3,6 +3,7 @@ import argparse
 
 from src.data_collection.data_collector import DataCollector
 from src.common.files import trajectory_save_dir
+from src.gym import turn_off_april_tags
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -13,8 +14,27 @@ if __name__ == "__main__":
     parser.add_argument("--furniture", "-f", type=str, required=True)
     parser.add_argument("--save-failure", action="store_true")
     parser.add_argument("--headless", action="store_true")
+    # ResiP's policies, teleop data and RL env all use diffik
+    parser.add_argument(
+        "--ctrl-mode", "-c", type=str, default="diffik", choices=["diffik", "osc"]
+    )
+    parser.add_argument(
+        "--keep-april-tags",
+        action="store_true",
+        help="Keep AprilTags on the part meshes (ResiP renders and trains without them)",
+    )
+    parser.add_argument("--suffix", type=str, default="")
+    parser.add_argument(
+        "--save-mp4",
+        action="store_true",
+        help="Also save an mp4 (wrist | front camera) next to each pickle",
+    )
 
     args = parser.parse_args()
+
+    # Load the tagless part meshes, like the RL env and the rest of the pipeline
+    if not args.keep_april_tags:
+        turn_off_april_tags()
 
     # TODO: Consider what we do with images of full size and if that's needed
     # For now, we assume that images are stored in 224x224 and we know that as`image`
@@ -24,10 +44,12 @@ if __name__ == "__main__":
     resize_sim_img = False
 
     data_path = trajectory_save_dir(
-        environment="sim",
+        controller=args.ctrl_mode,
+        domain="sim",
         task=args.furniture,
         demo_source="scripted",
         randomness=args.randomness,
+        suffix=args.suffix,
     )
 
     print(f"Saving data to directory: {data_path}")
@@ -40,15 +62,16 @@ if __name__ == "__main__":
         headless=args.headless,
         manual_label=False,
         scripted=True,
-        draw_marker=True,
+        draw_marker=False,
         randomness=args.randomness,
         save_failure=args.save_failure,
         num_demos=args.num_demos,
         resize_sim_img=resize_sim_img,
         compute_device_id=args.gpu_id,
         graphics_device_id=args.gpu_id,
-        ctrl_mode="osc",
+        ctrl_mode=args.ctrl_mode,
         compress_pickles=True,
+        save_mp4=args.save_mp4,
     )
 
     collector.collect()

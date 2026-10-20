@@ -81,7 +81,7 @@ What changes on Path B:
 |---|---|---|
 | §1.3 RT permissions | Do it | Do it too. It still improves timing |
 | §1.4 Optional `preempt=full` | Skip | Recommended |
-| §3.2 libfranka check | Run the examples as they are | Patch `communication_test` first (one line) |
+| §3.2 libfranka check | Run the examples as they are | Patch `communication_test` and `echo_robot_state` first (one line each) |
 | §4.3 Polymetis | No patch | Patch `franka_panda_client.cpp` (one line) |
 | §5.2 Launch | Default (asks for `sudo`) | Add `use_real_time=false` |
 
@@ -272,16 +272,24 @@ git clone --recursive https://github.com/frankaemika/libfranka --branch $LIBFRAN
 cd libfranka
 ```
 
-### 3.2 Patch the communication test (Path B only)
+### 3.2 Patch the two examples (Path B only)
 
-`communication_test` runs a control loop, so on a non-RT kernel it stops with `Running kernel does not have realtime capabilities` unless patched. `echo_robot_state` only reads state and doesn't need it.
+On a non-RT kernel, both examples stop with `Running kernel does not have realtime capabilities` unless patched. In older libfranka (0.10) only `communication_test` is affected, because the check runs when a control loop starts. In newer versions (0.18, probably earlier too) the check runs as soon as a `franka::Robot` is created, so even `echo_robot_state`, which only reads, is affected. Patching both works for every version:
 
 ```bash
-sed -i 's/franka::Robot robot(argv\[1\]);/franka::Robot robot(argv[1], franka::RealtimeConfig::kIgnore);/' \
-    examples/communication_test.cpp
-grep -n "franka::Robot robot" examples/communication_test.cpp
+# in ~/fr3_test/libfranka
+for f in examples/communication_test.cpp examples/echo_robot_state.cpp; do
+  sed -i 's/franka::Robot robot(argv\[1\]);/franka::Robot robot(argv[1], franka::RealtimeConfig::kIgnore);/' $f
+done
+grep -n "franka::Robot robot" examples/communication_test.cpp examples/echo_robot_state.cpp
 ```
-The `grep` must show `franka::Robot robot(argv[1], franka::RealtimeConfig::kIgnore);`. If the line looks different in your version, edit it by hand to add `, franka::RealtimeConfig::kIgnore` as the second argument.
+- `sed -i 's/OLD/NEW/' file` replaces the text OLD with NEW inside the file. `\[` and `\]` mean literal brackets.
+- The `for` loop runs that on both files.
+- `grep -n` prints the matching lines with their numbers, so you can check the result.
+
+The `grep` must show `franka::Robot robot(argv[1], franka::RealtimeConfig::kIgnore);` for **both** files. If a line looks different in your version, open the file (`nano examples/<file>.cpp`, Ctrl+W to search) and add `, franka::RealtimeConfig::kIgnore` after `argv[1]` by hand.
+
+If you've already built (§3.3), rebuild after patching: `cd build && cmake --build . -j$(nproc)`. Any other example you want to run needs the same edit.
 
 ### 3.3 Build and run
 
@@ -301,7 +309,7 @@ What to look for:
 | If you see | Do |
 |---|---|
 | `Incompatible library version (server version: X, library version: Y)` | Wrong libfranka for this FR3. Look up server version X in the compatibility table, pick a matching libfranka, set `LIBFRANKA_VER`, delete `~/fr3_test/libfranka` and redo §3 |
-| `Running kernel does not have realtime capabilities` | Path B: you skipped §3.2. Patch, then `cmake --build .` again |
+| `Running kernel does not have realtime capabilities` | Path B: that example isn't patched, or wasn't rebuilt after patching. Patch it (§3.2), then `cmake --build . -j$(nproc)` again |
 | Many lost packets / `communication_constraints_violation` | Check §1.5 (performance mode, AC power), §1.6 (direct cable, built-in port), close heavy programs, try §1.4. If it stays bad, you need Path A |
 | `Connection refused` / timeout | Wrong IP, cable in the arm's port instead of the Control box, or FCI not active (§2) |
 
@@ -336,6 +344,21 @@ git -C polymetis/src/clients/franka_panda_client/third_party/libfranka fetch --t
 ./scripts/build_libfranka.sh $LIBFRANKA_VER
 ```
 
+**libfranka 0.14 or later: pinocchio version clash.** These versions need pinocchio. Inside the `polymetis-local` env, CMake finds the env's own **pinocchio 2.5.2** (not the `/opt/openrobots` one from §3), while libfranka is written for pinocchio 3. With 0.18.0, this gives one error:
+```
+src/robot_model.cpp:35:26: error: 'const pinocchio::Frame' ... has no member named 'parentJoint'
+```
+pinocchio 2.5 calls that field `parent`, and every other pinocchio function libfranka 0.18 uses exists in 2.5. Rename it and rerun the script:
+```bash
+# (polymetis-local), in ~/fr3_test/fairo/polymetis
+sed -i 's/parent_frame\.parentJoint/parent_frame.parent/' \
+    polymetis/src/clients/franka_panda_client/third_party/libfranka/src/robot_model.cpp
+./scripts/build_libfranka.sh $LIBFRANKA_VER
+```
+Pass: it ends with `[100%] Built target franka`. Many `-Wmaybe-uninitialized` and `New Boost version may have incorrect or missing dependencies` warnings are normal.
+
+Don't point this build at the `/opt/openrobots` pinocchio 3 instead: Polymetis itself links the env's pinocchio 2.5.2, and two pinocchio versions in one program can crash.
+
 ### 4.3 Patch for a non-RT kernel (Path B only)
 
 ```bash
@@ -352,22 +375,105 @@ If it doesn't change, open the file, find `new franka::Robot(`, and add `, frank
 
 ### 4.4 Build
 
+**Newer libfranka and compilers (libfranka 0.18 with GCC 13 on Ubuntu 24.04): two source fixes first.** These were needed and sufficient on our setup. With older versions you may not need them, but they're harmless:
+```bash
+# (polymetis-local), in ~/fr3_test/fairo/polymetis/polymetis
+# 1) libfranka 0.18's headers use std::optional, which needs C++17; Polymetis asks for C++14.
+#    (Only the top-level file; torch_isolation/pinocchio_isolation keeps its own C++14 setting.)
+sed -i '8s/-std=c++14/-std=c++17/' CMakeLists.txt
+sed -n 8p CMakeLists.txt                       # must show: set(CMAKE_CXX_FLAGS "-std=c++17")
+
+# 2) GCC 13 no longer pulls in size_t implicitly: "'size_t' has not been declared" in torch_server_ops.hpp
+sed -i 's/^#include <map>$/#include <cstddef>\n#include <map>/' torch_isolation/include/torch_server_ops.hpp
+grep -n "#include" torch_isolation/include/torch_server_ops.hpp   # must list <cstddef> first
+```
+
+Then configure and build:
 ```bash
 # (polymetis-local), in ~/fr3_test/fairo/polymetis
 mkdir -p ./polymetis/build && cd ./polymetis/build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FRANKA=ON -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FRANKA=ON -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF \
+      -Dfmt_DIR=$PWD/../src/clients/franka_panda_client/third_party/libfranka/build/_deps/fmt-build
 make -j$(nproc)          # if the PC runs out of memory, use make -j4
 ls | grep -E "run_server|franka_panda_client|franka_hand_client"
 ```
+- `-Dfmt_DIR=…` is only needed for libfranka ≥ 0.14. Those versions need the fmt library; when fmt isn't installed, libfranka downloads and builds it inside its own build folder (`_deps/fmt-build`). This tells Polymetis where it is. Without it: `Could not find a package configuration file provided by "fmt"`.
+- Warnings like `New Boost version may have incorrect or missing dependencies`, `kineto_LIBRARY-NOTFOUND` and `Cannot generate a safe runtime search path … libz.so.1` are harmless.
+
 The last line should list all three programs. If you change the source later (for example, the §4.3 patch), just rerun `make -j$(nproc)` in this folder.
+
+Optional check that the robot client uses the right libraries:
+```bash
+ldd franka_panda_client | grep -E "franka|pinocchio|not found"
+# expect: libfranka.so.<your version> from …/third_party/libfranka/build, libpinocchio.so.2.5.2 from the env, and no "not found"
+```
 
 | If you see | Do |
 |---|---|
 | Errors inside `franka_panda_client*.cpp` | libfranka's API changed. Read the error. Small fixes (a renamed header or function, a new argument) are fine to patch. If it needs real porting, that's a no-go for this route |
 | Errors inside libfranka, like `'uint8_t' does not name a type` | Older libfranka with a newer compiler. Add `#include <cstdint>` at the top of the header the error names, then rebuild (§4.2, then §4.4) |
 | libfranka can't find a package | Newer libfranka needs extra dependencies. Install what its README lists for your tag |
+| `'optional' in namespace 'std' does not name a template type` | New libfranka headers need C++17 | Fix 1 above |
+| `'size_t' has not been declared` in `torch_server_ops.hpp` | New compiler | Fix 2 above |
+| `Could not find … "fmt"` during `cmake` | libfranka ≥ 0.14's fmt isn't installed system-wide | Add the `-Dfmt_DIR=…` option above |
 
-**✅ Go/no-go 4:** `make` finishes, and `run_server`, `franka_panda_client` and `franka_hand_client` exist in `polymetis/build`.
+### 4.5 Fix the stop command (required on Ubuntu 24.04, both paths)
+
+⚠️ **Do this before the first `launch_robot.py`.** Without it, pressing Ctrl+C in the robot server **kills every program in your desktop session** (terminal, browser, editor, the desktop itself), which looks like the PC shutting down. On Path A, where the cleanup runs with `sudo`, it kills every process on the whole system.
+
+Why: on Ctrl+C, `launch_robot.py` stops its server with `kill -9 -<pgid>` ("kill process group `<pgid>`"). Ubuntu 24.04's `kill` (procps 4.0.4) misreads a negative number given like that and keeps only its first digit. For example, `kill -9 -111629` becomes `kill -9 -1`, and `-1` means "every process I'm allowed to signal". Adding `--` before the number makes it parse correctly.
+
+```bash
+# (polymetis-local), in ~/fr3_test/fairo/polymetis/polymetis
+sed -i 's/\["sudo", "kill", "-9", f"-{pgid}"\]/["sudo", "kill", "-9", "--", f"-{pgid}"]/; s/\["kill", "-9", f"-{pgid}"\]/["kill", "-9", "--", f"-{pgid}"]/' \
+    python/scripts/launch_robot.py
+grep -n '"kill"' python/scripts/launch_robot.py
+```
+Both lines the `grep` prints must contain `"--"`:
+```
+63:            subprocess.check_call(["sudo", "kill", "-9", "--", f"-{pgid}"])
+69:            subprocess.check_call(["kill", "-9", "--", f"-{pgid}"])
+```
+No rebuild is needed: it's a Python script, and the editable install (§4.1) uses the file directly.
+
+You can check whether your `kill` has the bug, harmlessly (signal 0 doesn't kill anything):
+```bash
+strace -e trace=kill /usr/bin/kill -0 -45678 2>&1 | grep "^kill("
+# kill(-4, 0)     → bug present (only the first digit is kept)
+# kill(-45678, 0) → no bug
+```
+(`sudo apt install strace` if it's missing.) Apply the fix either way: with `--`, the command is correct for every version of `kill`.
+
+### 4.6 Fix the torque-control start (required with libfranka 0.18 on the FR3)
+
+**Symptom without it:** `launch_robot.py` prints `Connected.` and then nothing; the arm isn't held, and any script fails with `Robot context not valid when calling GetRobotClientMetadata!`. No error appears anywhere.
+
+**Cause** (found with a stack trace and three small test programs, `~/fr3_test/control_loop_test.cpp`): with libfranka 0.18 on our FR3, starting torque control as the **first motion after connecting** never gets past libfranka's start sequence. The robot answers "motion started" before its state stream shows the new mode. libfranka then decides the motion was aborted and waits forever for an abort message that never comes. It happens with both of libfranka's torque APIs. A short motion beforehand avoids it: after 0.5 s of "hold still" (zero joint velocity), torque control starts normally. `communication_test` never hits it, because it moves to a start pose first.
+
+**Fix:** make the robot client hold still for 0.5 s before each torque-control start, including restarts after automatic error recovery. Open `polymetis/src/clients/franka_panda_client/franka_panda_client.cpp`, find `robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);` in `run()`, and insert the block below **directly above** it, inside the same `try {`:
+```cpp
+        // FR3 + libfranka 0.18: starting torque control as the first motion after connecting (or
+        // after error recovery) deadlocks in libfranka's start sequence. A short zero-velocity
+        // motion first avoids it; the arm does not move.
+        int hold_cycles = 0;
+        robot_ptr_->control(
+            [&](const franka::RobotState &, franka::Duration) -> franka::JointVelocities {
+              franka::JointVelocities zero_velocities{{0, 0, 0, 0, 0, 0, 0}};
+              if (++hold_cycles >= 500) {
+                return franka::MotionFinished(zero_velocities);
+              }
+              return zero_velocities;
+            });
+        spdlog::info("Hold-still motion done; starting torque control.");
+```
+Then rebuild the robot client:
+```bash
+# (polymetis-local), in ~/fr3_test/fairo/polymetis/polymetis/build
+make -j$(nproc) franka_panda_client
+```
+With the fix, terminal 1 prints `Hold-still motion done; starting torque control.` right after `Connected.`.
+
+**✅ Go/no-go 4:** `make` finishes, `run_server`, `franka_panda_client` and `franka_hand_client` exist in `polymetis/build`, `launch_robot.py` has the `--` fix (§4.5), and the robot client has the hold-still fix (§4.6).
 
 ---
 
@@ -441,7 +547,7 @@ launch_gripper.py gripper=franka_hand gripper.executable_cfg.robot_ip=$FR3_IP
 
 What should happen: terminal 1 logs that it connected to the robot and keeps running. The arm stays where it is and feels slightly springy if you push it gently: Polymetis holds it with a soft default controller. Terminal 2 connects to the gripper and keeps running.
 
-To stop the servers: Ctrl+C in each terminal. If a later launch says `Port unavailable; possibly another server found`, an old server is still running: `pkill -9 run_server` (on Path A: `sudo pkill -9 run_server`).
+To stop the servers: Ctrl+C in each terminal. This is only safe with the §4.5 fix in place. If a later launch says `Port unavailable; possibly another server found`, an old server is still running: `pkill -9 run_server` (on Path A: `sudo pkill -9 run_server`).
 
 **✅ Go/no-go 5:** both servers keep running with no `Incompatible library version`, `realtime` or reflex errors, and the arm holds its pose.
 
@@ -492,8 +598,21 @@ Pass:
 cd ~/fr3_test
 pip uninstall -y rdt                          # in case the PyPI one is installed; "not installed" is fine
 git clone -b lars-dev https://github.com/anthonysimeonov/improbable_rdt.git
+pip install cython                            # setup.py imports Cython on its first lines (it compiles nothing)
 pip install -e improbable_rdt                 # package lives in src/rdt; setup.py declares no deps
 ```
+- No `--recurse-submodules`: `lars-dev` has two submodules (`pytorch_contactnet`, `pybullet-planning`), but none of the modules teleop imports uses them. Their URLs are SSH (`git@github.com:…`), so fetching them would also fail without a GitHub SSH key.
+- Without Cython, `pip install -e` fails with `ModuleNotFoundError: No module named 'Cython'`.
+
+`rdt` finds its own files (message definitions in `lcm_types`, configs) through the environment variable `RDT_SOURCE_DIR`. Without it, importing `rdt.image.factory` fails with `KeyError: 'RDT_SOURCE_DIR'`. The repo's `rdt_env.sh` sets it, but only when you `source` it by hand. Store it in the conda env instead, so it's set on every `conda activate polymetis-local`:
+```bash
+conda env config vars set -n polymetis-local RDT_SOURCE_DIR=$HOME/fr3_test/improbable_rdt/src/rdt
+conda deactivate && conda activate polymetis-local     # once, so it takes effect
+echo $RDT_SOURCE_DIR                                    # → /home/<you>/fr3_test/improbable_rdt/src/rdt
+```
+(`rdt_env.sh` also sets two variables for the submodules; teleop doesn't need them.)
+
+**pip and company package servers.** If your `pip install`s hang with `Retrying … ConnectTimeoutError` for an internal server (set in `/etc/pip.conf`), point this env at public PyPI: `pip config --site set global.index-url https://pypi.org/simple`. It's undone with `pip config --site unset global.index-url`.
 `lars-dev` is the branch with every module `teleop_sm.py` and `minimal.py` import:
 - `spacemouse/spacemouse_shared_memory.py`
 - `polymetis_robot_utils/{polymetis_util, interfaces/diffik}.py`
@@ -560,6 +679,12 @@ Pass: the six numbers change while you move the cap, and return to 0 when you le
 ---
 
 ## 8. Minimal edits to `teleop_sm.py`
+
+There are two ways to get a teleop script that runs on the FR3:
+- **Use the ready-made [src/real/teleop_sm_fr3.py](../src/real/teleop_sm_fr3.py)** (§8.2, recommended). It's a copy of the original with the six edits below already made, plus a `--no_gripper` switch for running without a gripper. The original `teleop_sm.py` stays untouched.
+- **Edit `teleop_sm.py` by hand** (§8.1). §8.1 explains each change; read it either way, since `teleop_sm_fr3.py` contains exactly these edits.
+
+### 8.1 The edits, one by one
 
 Only what's needed to start it, plus a switch to run without cameras. Open [src/real/teleop_sm.py](../src/real/teleop_sm.py) and make these six changes.
 
@@ -634,11 +759,42 @@ git diff src/real/teleop_sm.py
 ```
 `OK` means no syntax or indentation mistakes. To undo all six changes: `git checkout src/real/teleop_sm.py`.
 
+### 8.2 The ready-made version: `teleop_sm_fr3.py`
+
+[src/real/teleop_sm_fr3.py](../src/real/teleop_sm_fr3.py) is `teleop_sm.py` with changes 1–6 from §8.1 already made, in the same places, plus these extras:
+
+| Extra | What it does |
+|---|---|
+| `--server_ip` option, default `localhost` | Change 2 as an option instead of a fixed value. Only needed if the Polymetis server runs on another PC |
+| `--no_gripper` option | Starts without a gripper server. A stand-in gripper (class `NoGripper`) accepts the open/close commands and reports the commanded width as `gripper_width`: 6.5 cm when open, 0 after "close" (the Franka Hand closes fully when there's nothing to grasp) |
+
+To see every difference from the original:
+```bash
+git diff --no-index src/real/teleop_sm.py src/real/teleop_sm_fr3.py
+```
+
+With `--no_cameras` and `--no_gripper`, the saved episodes keep the exact format of real ones, so Phase 10 can still check the whole data pipeline. Both choices are saved in each episode's `args`, so placeholder episodes can always be identified later. Without the options, the script behaves like the hand-edited version.
+
+Check that it loads in your env. `--help` exits before touching the robot:
+```bash
+# (polymetis-local), in ~/ResiP
+python -m src.real.teleop_sm_fr3 --help
+```
+The option list must end with `[--server_ip SERVER_IP] [--no_cameras] [--no_gripper]`. An import error here means a §6 step is missing.
+
+**Running without a gripper (`--no_gripper`):**
+- Keep Desk's end effector set to **None** (*Settings → End-Effector*). The robot uses this setting to compensate the hand's weight; a wrong setting makes the arm drift.
+- Don't start the gripper server (terminal 2 in §9.1). Without a hand, it stops with `Connection to FCI refused`, which is expected.
+- In §9.2, check d (SpaceMouse button) only changes the recorded gripper command and width; nothing moves on the robot.
+- When you mount the Franka Hand later: set the end effector back to Franka Hand in Desk, start the gripper server, and drop `--no_gripper`.
+
 ---
 
 ## 9. First teleop run, in free space (no cameras)
 
 No parts on the table yet. Keep the enabling device in hand the whole time.
+
+Before the first run, read [FR3_POLYMETIS_SAFETY_REVIEW.md](FR3_POLYMETIS_SAFETY_REVIEW.md): it lists what can make the robot move faster or less expectedly than you'd assume (automatic restart after a stop, global keyboard, real speeds, diff-IK near singularities and limits, collision thresholds) and the planned fixes.
 
 ⚠️ **As soon as the script starts, the arm drives to the home pose** (gripper pointing down, in front of the base, with up to ±5° of random noise per joint). Make sure that path is clear before starting it.
 
@@ -647,7 +803,7 @@ No parts on the table yet. Keep the enabling device in hand the whole time.
 You need four terminals:
 ```bash
 # terminal 1: robot server, as in §5.2 (with use_real_time=false on Path B)
-# terminal 2: gripper server, as in §5.2
+# terminal 2: gripper server, as in §5.2 (skip it with no gripper mounted, see §8.2)
 
 # terminal 3: visualizer
 conda activate polymetis-local
@@ -662,11 +818,20 @@ cd ~/ResiP
 python -m src.real.teleop_sm -p 6000 --furniture one_leg --save_dir scratch/fr3_teleop_nocam \
        --max_pos_speed 0.15 --max_rot_speed 0.4 --no_cameras
 ```
+With the ready-made script (§8.2), use this instead. Add `--no_gripper` if no gripper is mounted:
+```bash
+# terminal 4: teleop with teleop_sm_fr3.py, from the repo root
+conda activate polymetis-local
+cd ~/ResiP
+python -m src.real.teleop_sm_fr3 -p 6000 --furniture one_leg --save_dir scratch/fr3_teleop_nocam \
+       --max_pos_speed 0.15 --max_rot_speed 0.4 --no_cameras --no_gripper
+```
 - `-p` must match meshcat's zmq port.
 - The two speed options halve the defaults (0.3 m/s and 0.7 rad/s) for this first session. Drop them once you're comfortable.
 - `--no_cameras` is the switch from §8. The `nocam` folder name keeps these placeholder episodes apart from real ones later.
+- `--no_gripper` (only in `teleop_sm_fr3.py`) replaces the gripper server with a stand-in (§8.2).
 
-What happens in order: the gripper opens to 6.5 cm, the arm moves to the home pose, joint impedance starts, it prints `--no_cameras: not opening any camera, ...`, and then `Start collecting!`. From here, the SpaceMouse moves the arm.
+What happens in order: the gripper opens to 6.5 cm (with `--no_gripper`, it prints `--no_gripper: …` instead), the arm moves to the home pose, joint impedance starts, it prints `--no_cameras: not opening any camera, ...`, and then `Start collecting!`. From here, the SpaceMouse moves the arm.
 
 ### 9.2 Check, in order
 
@@ -812,6 +977,8 @@ cd ~/ResiP
 python -m src.real.teleop_sm -p 6000 --furniture one_leg --save_dir scratch/fr3_teleop_test \
        --max_pos_speed 0.15 --max_rot_speed 0.4
 ```
+With `teleop_sm_fr3.py`: the same command with `src.real.teleop_sm_fr3`, keeping `--no_gripper` if there's still no gripper mounted.
+
 What changes compared with §9: after the arm reaches home, it prints `Enabling devices with serial numbers: ... (front) and ... (wrist)` and waits about 2 s for the cameras before `Start collecting!`.
 
 Repeat checks a, b, g and h from §9.2. Move around for at least 30 s before pressing `t`, so you can see that the cameras keep up: the loop must not stop with `Couldn't get frame for device`.
@@ -860,12 +1027,16 @@ Once everything above passes, a session is:
 | Polymetis build errors in `franka_panda_client` | libfranka API change | Patch small renames. If it needs real porting → switch to REAL_ROBOT_FR3_GUIDE.md |
 | `'uint8_t' does not name a type` (or similar) in libfranka | Old libfranka, new compiler | Add `#include <cstdint>` to that header, rebuild |
 | Hydra: `Could not override 'gripper.executable_cfg.robot_ip'` (or another key) | Key name differs in your Polymetis checkout | Check the keys in `conf/robot_client/franka_hardware.yaml` and `conf/gripper/franka_hand.yaml` |
+| Ctrl+C in the robot server closes all your programs / logs you out / looks like the PC shut down | `kill -9 -<pgid>` misparsed as `kill -9 -1` (Ubuntu 24.04 procps bug) | §4.5. Don't run `launch_robot.py` without it: every way of exiting runs the same cleanup |
+| Server prints `Connected.` then nothing; scripts fail with `Robot context not valid when calling GetRobotClientMetadata!` | Torque control can't start as the first motion (libfranka 0.18 + FR3) | §4.6 |
 | `Port unavailable; possibly another server found` | Old server still running | `pkill -9 run_server` (Path A: `sudo pkill -9 run_server`) |
 | `ModuleNotFoundError: rdt.spacemouse` (or similar) | Wrong `rdt` (PyPI or `master`) | `pip uninstall rdt`, then install the `lars-dev` clone (§6) |
+| `KeyError: 'RDT_SOURCE_DIR'` | `rdt`'s source-folder variable not set | §6: `conda env config vars set …`, then reactivate the env |
 | `ModuleNotFoundError: pyrealsense2` | Not installed, even though there are no cameras | `pip install pyrealsense2` (§6); the script imports it either way |
 | `TypeError: __init__() missing ... 'robot_home', 'Kq', 'Kqd'` | `lars-dev` `DiffIKWrapper` signature | §8, change 3 |
 | `ModuleNotFoundError: furniture_bench` | Line 24 not commented out | §8, change 1 |
 | `unrecognized arguments: --no_cameras` | §8 changes 4–6 not made | Make them; check with `python -m py_compile` |
+| Teleop hangs or errors at startup with no gripper mounted (gripper `RpcError` / `UNAVAILABLE` on port 50052) | `GripperInterface` has no gripper server to talk to | Use `teleop_sm_fr3.py` with `--no_gripper` (§8.2) |
 | `IndentationError` / `SyntaxError` in `teleop_sm.py` | Change 5 or 6 pasted with the wrong indentation | Compare with §8; method body lines start with 8 spaces, the `main()` block with 4 |
 | Camera error at startup (`No device connected`, `Couldn't resolve requests`, …) with no cameras attached | `--no_cameras` missing | Add `--no_cameras` to the command |
 | Client/server version mismatch error | `polymetis` client and server from different builds | Use the one env from §4 for both. `RobotInterface` also accepts `enforce_version=False` |

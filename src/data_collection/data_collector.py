@@ -14,9 +14,10 @@ from furniture_bench.data.collect_enum import CollectEnum
 from furniture_bench.sim_config import sim_config
 from furniture_bench.envs.initialization_mode import Randomness
 from furniture_bench.utils.scripted_demo_mod import scale_scripted_action
+import furniture_bench.controllers.control_utils as C
 
 from src.data_processing.utils import resize, resize_crop
-from src.visualization.render_mp4 import pickle_data
+from src.visualization.render_mp4 import pickle_data, create_mp4, data_to_video
 
 
 class DataCollector:
@@ -47,6 +48,7 @@ class DataCollector:
         resize_sim_img: bool = False,
         ctrl_mode: str = "osc",
         compress_pickles: bool = False,
+        save_mp4: bool = False,
         verbose: bool = False,
     ):
         """
@@ -68,6 +70,7 @@ class DataCollector:
             resize_sim_img (bool): Read resized image
             ctrl_mode (str): 'osc' (joint torque, with operation space control) or 'diffik' (joint impedance, with differential inverse kinematics control)
             compress_pickles (bool): Whether to compress the pickle files with gzip.
+            save_mp4 (bool): Also save an mp4 of both cameras (wrist | front) next to each pickle.
         """
         if is_sim:
             self.env = gym.make(
@@ -119,9 +122,31 @@ class DataCollector:
         self.save_failure = save_failure
         self.resize_sim_img = resize_sim_img
         self.compress_pickles = compress_pickles
+        self.save_mp4 = save_mp4
         self.verbose = verbose
 
         self._reset_collector_buffer()
+
+    def _append_obstacle_pose(self, obs):
+        """Append the U-fixture (obstacle_front) pose to parts_poses, in place.
+
+        The RL env's parts_poses is the parts followed by the fixture, all in the
+        AprilTag frame (42-D for one_leg), while FurnitureSimEnv returns only the parts.
+        """
+        if not self.is_sim or "parts_poses" not in obs:
+            return
+
+        rb_idx = self.env.part_idxs["obstacle_front"][0]
+        pose = self.env.rb_states[rb_idx, :7]
+        pos, quat = C.mat2pose(
+            self.env.sim_coord_to_april_coord(
+                C.pose2mat(pose[:3], pose[3:7], device=self.env.device)
+            )
+        )
+        obstacle_pose = torch.cat([pos, quat]).to(obs["parts_poses"].device)
+        obs["parts_poses"] = torch.cat(
+            [obs["parts_poses"], obstacle_pose.view(1, -1)], dim=-1
+        )
 
     def _verbose_print(self, msg):
         if self.verbose:
@@ -205,6 +230,7 @@ class DataCollector:
 
             # Execute action.
             next_obs, rew, done, info = self.env.step(action)
+            self._append_obstacle_pose(next_obs)
 
             if rew == 1:
                 self.last_reward_idx = len(self.acts)
@@ -287,6 +313,7 @@ class DataCollector:
 
     def reset(self):
         obs = self.env.reset()
+        self._append_obstacle_pose(obs)
         self._reset_collector_buffer()
 
         print("Start collecting the data!")
@@ -339,6 +366,11 @@ class DataCollector:
             path = path.with_suffix(".pkl.xz")
 
         pickle_data(data, path)
+
+        if self.save_mp4:
+            mp4_path = path.with_name(path.name.split(".")[0] + ".mp4")
+            create_mp4(data_to_video(data), mp4_path)
+            print(f"Video saved at {mp4_path}")
 
         print(f"Data saved at {path}")
 
