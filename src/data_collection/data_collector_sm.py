@@ -106,6 +106,7 @@ class DataCollectorSpaceMouse:
         compress_pickles: bool = False,
         resume_trajectory_paths: Union[List[str], None] = None,
         sample_perturbations: bool = False,
+        show_cameras: bool = False,
     ):
         """
         Args:
@@ -122,6 +123,7 @@ class DataCollectorSpaceMouse:
             ctrl_mode (str): 'osc' (joint torque, with operation space control) or 'diffik' (joint impedance, with differential inverse kinematics control)
             ee_laser (bool): If True, show a line coming from the end-effector in the viewer
             right_multiply_rot (bool): If True, convert rotation actions (delta rot) assuming they're applied as RIGHT multiplys (local rotations)
+            show_cameras (bool): If True, show the wrist and front camera images in a separate window while teleoperating
         """
         assert ctrl_mode == "diffik", "Highly suspicious that this is not 'diffik'"
 
@@ -162,6 +164,7 @@ class DataCollectorSpaceMouse:
         self.compress_pickles = compress_pickles
         self.resume_trajectory_paths = resume_trajectory_paths
         self.sample_perturbations = sample_perturbations
+        self.show_cameras = show_cameras
 
         self.iter_idx = 0
 
@@ -251,10 +254,10 @@ class DataCollectorSpaceMouse:
         args.command_latency = 0.01
         args.deadzone = 0.05
         if self.env.ctrl_mode == "diffik":
-            args.max_pos_speed = 0.15  # 0.8
+            args.max_pos_speed = 0.2  # 0.8
             # Per-axis max rotation speed (rad/s, before sm_drot_scalar), about the robot
             # base frame's x (toward the operator), y (right) and z (vertical, cap twist).
-            args.max_rot_speed = np.array([0.2, 0.2, 0.6])  # 3.0
+            args.max_rot_speed = np.array([0.2, 0.2, 0.8])  # 3.0
         else:
             args.max_pos_speed = 0.8
             # args.max_rot_speed = 2.5
@@ -323,7 +326,7 @@ class DataCollectorSpaceMouse:
         shm_manager = SharedMemoryManager()
         shm_manager.start(die_with_parent, (os.getpid(),))
         with shm_manager:
-            with ParentBoundSpacemouse(shm_manager=shm_manager, deadzone=(0.05, 0.05, 0.05, 0.3, 0.05, 0.3)) as sm:
+            with ParentBoundSpacemouse(shm_manager=shm_manager, deadzone=(0.10, 0.10, 0.10, 0.3, 0.05, 0.3)) as sm:
                 t_start = time.monotonic()
 
                 prev_keyboard_gripper = -1
@@ -548,6 +551,8 @@ class DataCollectorSpaceMouse:
                             )
 
                     obs = next_obs
+                    if self.show_cameras:
+                        self.display_cameras(obs)
 
                     # target_pose = new_target_pose
                     translation, quat_xyzw = self.env.get_ee_pose()
@@ -572,6 +577,27 @@ class DataCollectorSpaceMouse:
                 self.verbose_print(
                     f"Collected {self.traj_counter} / {self.num_demos} successful trajectories!"
                 )
+
+    def display_cameras(self, obs):
+        """Show the wrist | front camera images, as rendered for the recorded observations."""
+        import cv2
+
+        frames = []
+        for key in ("color_image1", "color_image2"):
+            img = obs[key]
+            if isinstance(img, torch.Tensor):
+                img = img.cpu().numpy()
+            img = np.asarray(img).squeeze()  # drop the env dimension
+            if img.shape[0] == 3:  # channel-first
+                img = img.transpose(1, 2, 0)
+            frames.append(img.astype(np.uint8))
+        h = min(f.shape[0] for f in frames)
+        frames = [cv2.resize(f, (round(f.shape[1] * h / f.shape[0]), h)) for f in frames]
+        if not hasattr(self, "_camera_window"):
+            self._camera_window = "wrist | front"
+            cv2.namedWindow(self._camera_window, cv2.WINDOW_NORMAL)
+        cv2.imshow(self._camera_window, cv2.cvtColor(np.hstack(frames), cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
 
     def set_target_pose(self):
         translation, quat_xyzw = self.env.get_ee_pose()

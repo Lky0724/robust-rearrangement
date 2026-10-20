@@ -161,7 +161,11 @@ def main(cfg: DictConfig):
         if cfg.seed is None:
             cfg.seed = random.randint(0, 2**32 - 1)
 
-        run_name = f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
+        # Use the given name for both the WandB run and models/<run_name>, else generate one
+        run_name = (
+            cfg.wandb.get("name", None)
+            or f"{int(time.time())}__{cfg.actor_name}_ppo__{cfg.seed}"
+        )
 
     if "task" not in cfg.env:
         cfg.env.task = "one_leg"

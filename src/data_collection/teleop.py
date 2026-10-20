@@ -61,6 +61,11 @@ def main():
         "--sample-perturbations",
         action="store_true",
     )
+    parser.add_argument(
+        "--show-cameras",
+        action="store_true",
+        help="Show the wrist and front camera views in a separate window",
+    )
 
     args = parser.parse_args()
 
@@ -105,6 +110,7 @@ def main():
         compress_pickles=False,
         resume_trajectory_paths=pickle_paths,
         sample_perturbations=args.sample_perturbations,
+        show_cameras=args.show_cameras,
     )
     data_collector.collect()
 

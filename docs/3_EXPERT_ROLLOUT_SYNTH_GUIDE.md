@@ -33,7 +33,7 @@ Numbers in the examples come from one run of the 3a command with a med-randomnes
 | **3a** | Roll out ResiP, keep successes | `resip` | med ResiP ckpt | D_synth pickles | Works as is |
 | **3b** | Fix two bugs in the processing and re-render code | — | — | code | **Required** (§4) |
 | **3c** | Install Isaac Sim + Isaac Lab | new `isaaclab` env | — | — | Manual setup (§5) |
-| **3d** | Match the render cameras to your real cameras | `isaaclab` | camera intrinsics and poses | code constants | Required for your hardware (§6) |
+| **3d** | Match the render cameras to your real cameras; optionally render an FR3 instead of the Panda | `isaaclab` | camera intrinsics and poses; FR3 USD | code constants | Required for your hardware (§6); FR3 recommended (§6.1) |
 | **3e** | Re-render every D_synth episode | `isaaclab` | D_synth pickles | D'_synth pickles | Slow; run in a resumable loop (§7) |
 | **3f** | Process D'_synth into zarr(s) | `resip` | D'_synth pickles | zarr(s) | Needs chunking on 60 GB RAM (§8) |
 | (opt.) | Re-render the teleop demos too | `isaaclab` | raw teleop pickles | rendered demo zarr | §9 |
@@ -267,7 +267,39 @@ Procedure:
 2. Render the first frame of one episode without `--save` (§7.1) with the robot at a similar pose. Compare side by side, as the authors did in `notebooks/07_as_align_inspect_cameras.ipynb` / `07_la_sim_real_visual_align.ipynb`.
 3. Adjust the pose until the table edge, fixture and gripper fingers line up. The camera-pose jitter of `-dr` (σ = 2.5 mm, 0.5° front; 0.75 mm, 0.25° wrist) only covers small residual errors.
 
-The render uses the Isaac Lab **Panda** model. For a Franka Research 3 the kinematics and the Franka Hand are the same; only the arm links look slightly different in the front view.
+### 6.1 Rendering an FR3 instead of the Panda
+
+The script renders Isaac Lab's **Panda** (`FRANKA_PANDA_CFG`). If you deploy on a Franka Research 3, switch the rendered arm to an FR3. Do this after the camera matching above, which has the larger effect on the images, but before the full re-render run, so you don't have to render everything twice.
+
+**Why it works without re-running 3a:** the replay writes the recorded `joint_positions` directly into the rendered arm; there's no IK. The FR3 has the same kinematic (DH) parameters as the Panda, so the same joint angles give the same hand pose. The FR3's joint limits are tighter, though (e.g. joint 6 ≥ 0.54 rad). On the example D_synth, all 201,120 frames are inside the FR3 limits from Franka's datasheet (joint 6 spans 1.16–3.55 rad), so the FR3 can physically reach every pose. Check your own data the same way if you regenerate it.
+
+**What changes in the images:**
+
+| Camera | Sees of the robot | Panda vs FR3 |
+|---|---|---|
+| Wrist (`color_image1`) | Mostly the Franka Hand and fingers | Identical: same hand |
+| Front (`color_image2`) | The arm links, often large in the frame | Link shapes, joint housings and colors differ |
+
+Domain randomization varies colors and lighting but not the arm's shape. So with the Panda model, the front view of D'_synth shows an arm the real FR3 doesn't have. D_real already shows the policy the real arm, so this is a refinement, not a requirement.
+
+**Steps:**
+
+1. **Get an FR3 USD.** Check your Isaac Sim assets for an FR3 robot first. Otherwise, convert the FR3 URDF from [`franka_description`](https://github.com/frankaemika/franka_description) with Isaac Lab's converter. Generate the URDF with the hand attached, and keep the visual meshes:
+   ```bash
+   python IsaacLab/source/standalone/tools/convert_urdf.py <fr3_with_hand.urdf> $PWD/src/sim2real/assets/franka/fr3/fr3.usd
+   ```
+   (In some Isaac Lab 1.x versions the tool is at `scripts/tools/convert_urdf.py`. Without `--fix-base` the base floats; the script places it at a fixed pose either way.)
+2. **Point the robot config at it** ([isaac_lab_rerender.py:701](../src/sim2real/isaac_lab_rerender.py#L701)). Keep the base placement:
+   ```python
+   robot_cfg = FRANKA_PANDA_CFG.replace(prim_path="/World/Robot_2")
+   robot_cfg.spawn.usd_path = f"{os.getenv('RARL_SOURCE_DIR')}/sim2real/assets/franka/fr3/fr3.usd"
+   ```
+   `FRANKA_PANDA_CFG` also sets initial joint positions and actuators keyed by `panda_joint.*` / `panda_finger_joint.*` names. If the FR3 asset names its joints `fr3_joint*`, rewrite those patterns in `robot_cfg.init_state.joint_pos` and `robot_cfg.actuators`, or Isaac Lab fails to match them at spawn.
+3. **Move the wrist camera to the FR3 hand link** ([isaac_lab_rerender.py:711](../src/sim2real/isaac_lab_rerender.py#L711)): `prim_path="/World/Robot_2/<hand link>/camera"`, e.g. `fr3_hand`. Keep the local offset at lines 744–751: the camera mounts on the same hand, so its pose relative to the hand doesn't change. Check that the hand link's frame matches `panda_hand`'s (same origin and axes). If it doesn't, the wrist view will be rotated or shifted.
+4. **Check the joint order.** The script writes 9 values per frame: 7 arm joints, then `gripper_finger_1_pos`, `gripper_finger_2_pos`. Print `robot.joint_names` once after `sim.reset()`. It must list the 7 arm joints in order 1–7, followed by the two finger joints. If not, reorder the tensor in both `write_joint_state_to_sim` calls (lines ~813 and ~1050).
+5. **Verify with one frame.** Run the §7.1 smoke test with `--save` on episode 0 and compare its front image with a real FR3 front image at a similar pose. Also compare the first frame against a Panda render of the same episode: the hand and fingers must land in the same place, and only the arm's appearance may differ. If the hand moves, the hand frame or joint order is wrong.
+
+If the conversion turns into a time sink, rendering with the Panda is an acceptable fallback: the wrist view is the same either way.
 
 ---
 
@@ -311,7 +343,7 @@ Re-running the same loop resumes where it stopped. `LC_ALL=C sort` matches Pytho
 
 ```
 ┌─ Launch Isaac Sim (AppLauncher), load table room, background, fixture walls,
-│  5 parts (tabletop + 4 legs, USD from src/sim2real/assets), Panda, front + wrist cameras
+│  5 parts (tabletop + 4 legs, USD from src/sim2real/assets), Panda (or FR3, §6.1), front + wrist cameras
 ├─ Place robot (joint positions + finger positions of frame 0), parts (parts_poses, AprilTag → sim frame),
 │  fixture (last 7 values of parts_poses)
 ├─ For every observation t (T + 1 frames):
@@ -385,6 +417,7 @@ Then process with `-f one_leg_render_demos -s teleop -r med`. The authors render
 | D_synth count and spread | `visualize_data.py info/plot` on the rollout folder | ~400 episodes; initial part poses spread over the med area |
 | Clip fix applied | in a processed zarr, the mean angle between the `action/pos` rotation and the `robot_state` rotation | On the order of 0.1 rad for rollouts, not ~0.01 |
 | Rendered images | `visualize_data.py video` on a few D'_synth pickles or a zarr; side by side with real frames | Same framing, gripper visible, plausible colors |
+| Robot model (FR3) | Front image of a rendered frame vs a real FR3 frame at a similar pose (§6.1) | The arm looks like your FR3; hand and fingers in the same place as in a Panda render |
 | Camera order | the same videos | wrist left / front right, as for D_real |
 | Zarr contents | `visualize_data.py info` on each `part_k.zarr` | `color_image1/2` (N, 240, 320, 3); episodes sum to the pickle count |
 | Coverage | `notebooks/07_real_vs_sim_state_action_space.ipynb` (Fig. 19) once D_real exists | Sim action xyz covers the real ones |

@@ -191,6 +191,8 @@ A better policy between two evals isn't lost for learning: those weights keep tr
 
 ## 6. Making training faster
 
+On an RTX 4090 there's room for more parallel envs: see [2a_RESIDUAL_PPO_4090_BENCHMARK.md](2a_RESIDUAL_PPO_4090_BENCHMARK.md) (recommends `num_envs=2048 num_minibatches=2`). The advice below was written for the 8 GB laptop GPU.
+
 The rollout takes ~92% of the time and the GPU is compute-bound (~98% utilization), so the gains come from doing less work:
 
 | Change | Effect | Caveat |
@@ -284,6 +286,7 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 | `eval_first` | `true` | Shifts the schedule so iteration 1 is an eval, which measures the untrained residual (≈ base policy SR). |
 | `checkpoint_interval` | −1 | Save `actor_chkpt_<iteration>.pt` every N iterations. −1 = off. Each file is ~266 MB (see §5). The best-SR checkpoint is saved regardless. |
 | `wandb.entity` | `null` | wandb user or team. `null` falls back to `WANDB_ENTITY` or your login's default entity. |
+| `wandb.name` | `null` | Run name, used for both the wandb run and the local `models/<name>/` folder. `null` generates `<timestamp>__residual_diffusion_ppo__<seed>`. Pick a unique name: two runs with the same name write to the same `models/` folder. Ignored when resuming with `continue_run_id`. |
 | `wandb.project` | `${env.task}-residual-rl` | wandb project, e.g. `one_leg-residual-rl`. |
 | `wandb.mode` | `online` | `online`, `offline` (sync later with `wandb sync`) or `disabled`. |
 | `wandb.notes` | `null` | Free-text notes attached to the run. |

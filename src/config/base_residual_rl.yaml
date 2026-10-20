@@ -84,6 +84,7 @@ wandb:
   project: ${env.task}-residual-rl
   mode: online
   entity: null
+  name: null  # Run name for WandB and models/<name>; null generates <timestamp>__<actor>_ppo__<seed>
   notes: null
   continue_run_id: null
 
