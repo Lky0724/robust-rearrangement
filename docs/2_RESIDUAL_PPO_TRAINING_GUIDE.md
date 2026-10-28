@@ -103,6 +103,72 @@ An **eval iteration** does steps 1–3 with mean residual actions, saves the che
 
 Full example run: `697 × 207 s + ~175 × 190 s ≈ 47 h`. In practice you don't need all of it: the authors' `one_leg` low checkpoint was saved at ~175M steps. See §6.
 
+### 2.5 Why the success rate goes up
+
+In one sentence: exploration noise tries slightly different corrections, the critic judges which ones turned out better than expected, and PPO shifts the residual's mean a little toward those. Repeating this every iteration makes successful corrections more likely, so SR rises.
+
+**Step 1 — try variations (rollout).** At every step the residual outputs a Gaussian and samples a correction from it (`residual_ppo.py`, rollout loop):
+
+```
+μ = actor(obs, base_action)          # residual mean; eval uses only this
+a = μ + σ·ε,  ε ~ N(0, 1),  σ ≈ 0.37
+action = base_action + 0.1 × a       # what is executed
+```
+
+Different envs draw different ε, so 2048 envs produce 2048 slightly different trajectories: some succeed, some fail. These differences are what PPO learns from. Without noise every action would equal μ, and there would be nothing to compare.
+
+**Step 2 — score each step against expectation (advantage).** The critic learns V(s): the expected discounted future reward from state s, roughly "probability of success × 0.999^steps remaining". GAE (`calculate_advantage`) turns it into a per-step advantage, i.e. how much better the outcome was than the critic expected:
+
+```
+δ_t = r_t + γ·V(s_{t+1}) − V(s_t)                  # did the outlook improve after this step?
+A_t = δ_t + γλ·δ_{t+1} + (γλ)²·δ_{t+2} + …         # γ = 0.999, λ = 0.95
+```
+
+The critic is what assigns credit to specific steps. Say the leg lines up with the hole at step 600 of a successful episode. Before that, V is low (success looks unlikely); right after, V jumps. So δ is large and positive around step 600, and the credit goes to the actions that produced the alignment, not to all ~800 steps equally. Advantages are then normalized to mean 0, std 1 (`norm_adv: true`), so what matters is better or worse than average.
+
+**Step 3 — move the mean toward the good noise (policy gradient).** PPO maximizes A_t × log π(a_t | s_t). For a Gaussian policy, the gradient with respect to the mean is
+
+```
+∂ log π / ∂μ = (a − μ) / σ² = ε / σ
+```
+
+so each sample pushes μ in proportion to **A_t × ε**:
+- A > 0 (this noise led to a better outcome): μ moves toward ε, making that correction more likely next time.
+- A < 0: μ moves away from it.
+- Noise unrelated to the outcome cancels out over ~2M samples.
+
+What survives is a consistent pattern such as "when the end effector is left of the hole just before insertion, correct 5 mm to the right". The actor network generalizes it to similar states.
+
+**Step 4 — move only a little (clip and KL).** The probability ratio π_new / π_old is clipped to [0.8, 1.2] (`clip_coef=0.2`), and an iteration's update stops early if approx-KL exceeds `target_kl=0.1`. The batch only describes behavior near the old policy, so moving far would make it unreliable. PPO therefore takes a small step, collects fresh data with the new policy, and repeats.
+
+**Why eval SR rises.** Eval runs only the mean μ, and every update pushes μ toward corrections that succeed more often. The process is a positive feedback loop: a better μ gives more successes in the next rollout, more successes give more reliable advantages and gradients, and those give a better μ.
+
+**Why MSEL falls.** With γ = 0.999, a success at step 500 is worth 0.999⁵⁰⁰ ≈ 0.61 but only 0.45 at step 800. Faster successes get larger advantages, so step 3 also pushes the policy to finish sooner.
+
+### 2.6 The shape of the learning curve
+
+The feedback loop makes eval SR follow an S-curve. Each phase has a different bottleneck:
+
+| Phase | Bottleneck | What you see |
+|---|---|---|
+| **Flat start** | Learning signal. Few successes under noise, and the critic hasn't learned V yet, so the gradient is mostly noise. A large LR only moves further along a noisy direction. | Eval SR flat; training SR may still rise as the residual learns to tolerate its own noise. `explained_variance` still low. |
+| **Fast middle** | None in particular. Enough successes for reliable gradients, and the LR is still high. | Eval and training SR climb together. |
+| **Slow end** | Either the **LR** (the cosine schedule has decayed) or the **ceiling** (the remaining failures are beyond the residual's ±~2 cm correction range, e.g. a bad grasp or the base getting stuck). | SR growth slows. |
+
+PPO has no fixed dataset to "use up": it collects fresh data with the current policy every iteration. A late slowdown therefore comes from the LR or from the policy's ceiling, never from exhausted data.
+
+**Telling LR-limited from ceiling-limited:** if `losses/clipfrac` and `losses/approx_kl` shrink toward 0 while training SR is already high (plenty of signal), the updates themselves have become tiny, so the run is LR-limited. Continue training with a fresh schedule (§5.1). If SR stays flat even at full LR, the run is at the ceiling, and improving the base policy will help more than more RL.
+
+**Example: `one_leg` med with a weak base policy** (own 51-demo BC policy, base SR 11.8%, 2048 envs, 500M steps):
+
+| Eval iterations | Eval SR | Training SR | LR (share of peak) | `clipfrac` | Reading |
+|---|---|---|---|---|---|
+| 1–46 (~0–90M steps) | 10.3–11.8%, flat | 1.5% → 4.7% | ~100% | — | Signal-limited: ~30 successful episodes per 2048; `explained_variance` only 0.48 at the start |
+| 121 → 196 | 22.8% → 32.3% | 16% → 26% | ~60% → 29% | ~0.06 | Fast middle |
+| 196 → 271 | 32.3% → 38.5% | 26% → 35% | ~29% → 3.5% | 0.058 → 0.010 | LR-limited: plenty of signal, but updates shrank with the LR |
+
+For comparison, the `one_leg` low run (base SR 44%, training SR 13–15% under noise) skipped the flat start and reached 81% at 45M steps. The size of the drop from eval SR to training SR at iteration 2 is a good early indicator of how long the flat start will last.
+
 ---
 
 ## 3. Reading the console output
@@ -123,6 +189,7 @@ Iteration 2/697, global step 716800, SPS 3452
 | Field | Meaning |
 |---|---|
 | `Evaluation success rate improved…` | The previous eval iteration beat the best eval SR so far, and the checkpoint was overwritten. |
+| `Iteration: N/697` | `N` counts eval and training iterations; `697` (`num_iterations`) counts training iterations only. So `N` exceeds the total near the end of a run, e.g. `Iteration: 280/244`. The run ends when `global_step` reaches `total_timesteps`. |
 | `Eval mode` | `True` = deterministic evaluation, no training. `False` = collect data and update. |
 | `env_step` | Step within the current 700-step rollout, printed every 100 steps. |
 | `global_step` | Total training transitions so far (`num_envs` × steps). Doesn't advance during eval, which is why iteration 2 starts at 101 × 1024 = 103,424. |
@@ -186,6 +253,44 @@ These ranges are common PPO rules of thumb, not values derived from this repo.
 Each checkpoint is **~266 MB** because it includes the frozen diffusion base policy. Don't set `checkpoint_interval=1` (~230 GB over a full run). `checkpoint_interval=25` gives ~28 snapshots (~7.5 GB), which is a reasonable safety net against a performance collapse between evals.
 
 A better policy between two evals isn't lost for learning: those weights keep training. Only the exact snapshot can be lost. PPO changes the policy in small steps (`clip_coef: 0.2`, `target_kl: 0.1`), so this rarely matters over a 4-iteration gap.
+
+### 5.1 Stopping, continuing and restarting
+
+**Stopping.** Send SIGINT once: Ctrl+C in the terminal, or `kill -INT <pid>` for a background run. Avoid the second or two right after `Evaluation success rate improved. Model saved to …` prints, while the checkpoint is being written. Any other moment is safe, since the best checkpoint is already on disk. wandb marks the run `killed`; its curves and files are kept.
+
+**Three ways to train further:**
+
+| Goal | How | Optimizer and LR schedule | Notes |
+|---|---|---|---|
+| **Continue from the best checkpoint with a fresh LR schedule** (e.g. the run was LR-limited, §2.6) | New run with `actor.residual_policy.pretrained_wts=<ckpt>` and `actor.residual_policy.pretrained_load_optim=false` | Fresh: warmup, then cosine over the new `total_timesteps` | Loads the weights only, including `actor_logstd`, so `init_logstd` has no effect. The first eval should match the checkpoint's SR. |
+| Pick up an interrupted run exactly where it stopped | `wandb.continue_run_id=<wandb run id>` | Restored, including the step count | Reloads the run's own config; command-line changes to the schedule are not applied. |
+| **Restart from scratch** (e.g. new noise setting, new base policy) | New run without `pretrained_wts` | Fresh | The residual starts at exactly zero (`action_head_std: 0`), so the first eval equals the base policy's SR. |
+
+⚠️ With `pretrained_load_optim=true` (the default), `pretrained_wts` also restores the old optimizer and LR-scheduler state. The cosine schedule then resumes at the old run's step count but uses this run's `num_iterations`. If they differ, the LR reaches 0 early and then **rises again**: the diffusers cosine formula climbs back up once progress passes 1. For a warm start, set it to `false`.
+
+**Continue (warm start) template:**
+
+```bash
+python -m src.train.residual_ppo \
+  base_policy.wt_path=<bc ckpt> \
+  actor.residual_policy.pretrained_wts=models/<old run>/actor_chkpt_best_success_rate.pt \
+  actor.residual_policy.pretrained_load_optim=false \
+  env.task=<task> env.randomness=<level> num_env_steps=<N> num_envs=<E> num_minibatches=<M> \
+  total_timesteps=<budget> debug=false \
+  wandb.name=<new unique name>
+```
+
+Use the same `base_policy.wt_path`, `env.*`, `num_env_steps` and `num_envs` as the old run, and a new `wandb.name`, so the old run's checkpoint isn't overwritten.
+
+**Running in the background.** To keep a run going after the terminal closes, and to keep the log file up to date:
+
+```bash
+PYTHONUNBUFFERED=1 setsid nohup python -m src.train.residual_ppo … > logs/<name>.log 2>&1 < /dev/null &
+tail -f logs/<name>.log
+pgrep -af src.train.residual_ppo        # PID to use with kill -INT
+```
+
+`logs/` is in `.gitignore`. Without `PYTHONUNBUFFERED=1`, Python block-buffers output written to a file, and the log only updates in large chunks.
 
 ---
 
@@ -307,7 +412,8 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 | `actor_activation` / `critic_activation` | `ReLU` | ReLU (critic) | Hidden-layer activation. |
 | `critic_last_layer_bias_const` | 0.25 | 0.25 | Initial bias of the value output. |
 | `critic_last_layer_std` | 0.25 | — | Orthogonal-init gain of the value output layer. |
-| `pretrained_wts` | `null` | — | Path to a previous residual checkpoint to warm-start the residual's weights. Optimizers and schedules start fresh. |
+| `pretrained_wts` | `null` | — | Path to a previous residual checkpoint to warm-start from. Loads the weights, including `actor_logstd`, so `init_logstd` has no effect when this is set. |
+| `pretrained_load_optim` | `true` | — | With `true`, `pretrained_wts` also loads the old optimizer and LR-scheduler state, so the cosine schedule resumes at the old run's step count. If this run's `num_iterations` differs, LR then reaches 0 early and rises again afterwards. Set `false` to keep only the weights and start a fresh optimizer and schedule, including warmup. |
 
 ### 7.7 Optimization
 

@@ -282,12 +282,24 @@ def main(cfg: DictConfig):
             agent.residual_policy.load_state_dict(run_state_dict["model_state_dict"])
         else:
             agent.load_state_dict(run_state_dict["model_state_dict"])
-        optimizer_actor.load_state_dict(run_state_dict["optimizer_actor_state_dict"])
-        optimizer_critic.load_state_dict(run_state_dict["optimizer_critic_state_dict"])
-        lr_scheduler_actor.load_state_dict(run_state_dict["scheduler_actor_state_dict"])
-        lr_scheduler_critic.load_state_dict(
-            run_state_dict["scheduler_critic_state_dict"]
-        )
+
+        # Set pretrained_load_optim=false to warm-start the weights with a fresh
+        # optimizer and LR schedule (the schedule length comes from this run's config)
+        if cfg.actor.residual_policy.get("pretrained_load_optim", True):
+            optimizer_actor.load_state_dict(
+                run_state_dict["optimizer_actor_state_dict"]
+            )
+            optimizer_critic.load_state_dict(
+                run_state_dict["optimizer_critic_state_dict"]
+            )
+            lr_scheduler_actor.load_state_dict(
+                run_state_dict["scheduler_actor_state_dict"]
+            )
+            lr_scheduler_critic.load_state_dict(
+                run_state_dict["scheduler_critic_state_dict"]
+            )
+        else:
+            print("Using a fresh optimizer and LR schedule for the pretrained weights")
 
     steps_per_iteration = cfg.data_collection_steps
 

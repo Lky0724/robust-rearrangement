@@ -36,6 +36,7 @@ env:
 actor:
   residual_policy:
     pretrained_wts: null
+    pretrained_load_optim: true  # false: load only the weights from pretrained_wts, start a fresh optimizer and LR schedule
     init_logstd: -1.0
     learn_std: false
 
