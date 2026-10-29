@@ -201,6 +201,9 @@ class RLPolicyEnvWrapper:
         reset_on_failure=False,
         reward_clip=5.0,
         sample_perturbations=False,
+        torque_penalty_coef=0.0,
+        torque_threshold=0.5,
+        terminate_torque_ratio=None,
         device="cuda",
     ):
         self.env = env
@@ -213,6 +216,31 @@ class RLPolicyEnvWrapper:
             else None
         )
         self.sample_perturbations = sample_perturbations
+
+        # Safety diagnostics and the optional excessive-force penalty.
+        # The arm has gravity disabled, so measured joint torques only grow when the
+        # robot pushes against something (e.g. forcing a part into place).
+        self.torque_penalty_coef = torque_penalty_coef
+        self.torque_threshold = torque_threshold
+        self.track_safety = hasattr(self.env, "forces") and hasattr(
+            self.env, "pairs_to_assemble"
+        )
+        if self.track_safety:
+            # Franka joint torque limits (Nm) for joints 1-7
+            self.torque_limits = torch.tensor(
+                [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], device=self.device
+            )
+            # Part that gets inserted/screwed: second part of the first assembly pair
+            self.tracked_part_idx = self.env.pairs_to_assemble[0][1]
+        self.prev_part_quat = None
+
+        # Fail an episode once its torque ratio exceeds this value before success.
+        # The failure is latched: the env stays done and gets no success reward.
+        self.terminate_torque_ratio = terminate_torque_ratio
+        self.force_failed = torch.zeros(
+            self.env.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.succeeded = torch.zeros_like(self.force_failed)
 
         self.env_success = torch.zeros(
             self.env.num_envs, device=self.device, dtype=torch.bool
@@ -245,7 +273,38 @@ class RLPolicyEnvWrapper:
         self.env_success = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        # Re-read the tracked part's orientation on the first step after a reset
+        self.prev_part_quat = None
+        self.force_failed = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self.succeeded = torch.zeros_like(self.force_failed)
         return obs
+
+    def _safety_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-env max joint torque as a fraction of its limit, and the tracked
+        part's rotation (rad) since the previous step."""
+        torque_ratio = (
+            self.env.forces[:, :7].abs() / self.torque_limits
+        ).max(dim=1).values
+
+        part_quat = self.env.rb_states[self.env.furniture_rb_indices][
+            :, self.tracked_part_idx, 3:7
+        ].clone()
+        if self.prev_part_quat is None:
+            part_rotation = torch.zeros(self.num_envs, device=self.device)
+        else:
+            # Angle between orientations, 4 * atan2(|q1 - q2|, |q1 + q2|) with both
+            # quats in the same hemisphere. Unlike 2 * acos(|q1.q2|), this stays
+            # accurate near 0, so per-step float error doesn't add up over an episode.
+            sign = torch.sign((part_quat * self.prev_part_quat).sum(dim=-1, keepdim=True))
+            prev = self.prev_part_quat * torch.where(sign == 0, 1.0, sign)
+            part_rotation = 4.0 * torch.atan2(
+                (part_quat - prev).norm(dim=-1), (part_quat + prev).norm(dim=-1)
+            )
+        self.prev_part_quat = part_quat
+
+        return torque_ratio, part_rotation
 
     def step(self, action: torch.Tensor):
         assert action.shape[1:] == self.action_space.shape
@@ -256,6 +315,29 @@ class RLPolicyEnvWrapper:
         )
         reward = reward.squeeze()
         termination = termination.squeeze()
+
+        if self.track_safety:
+            torque_ratio, part_rotation = self._safety_stats()
+            info["torque_ratio"] = torque_ratio
+            info["part_rotation"] = part_rotation
+
+            if self.terminate_torque_ratio is not None:
+                # Only count steps before success; a failed env never succeeds later
+                self.force_failed |= (
+                    torque_ratio > self.terminate_torque_ratio
+                ) & ~self.succeeded
+                self.succeeded |= termination & ~self.force_failed
+                reward = torch.where(self.force_failed, 0.0, reward)
+                termination = termination | self.force_failed
+                info["force_failed"] = self.force_failed.clone()
+
+        # Keep the task reward (0/1 per assembled pair, minus force failures) for success statistics
+        info["task_reward"] = reward.clone()
+
+        if self.track_safety and self.torque_penalty_coef > 0:
+            reward = reward - self.torque_penalty_coef * torch.clamp(
+                torque_ratio - self.torque_threshold, min=0.0
+            )
 
         if self.reward_normalizer is not None:
             reward = self.reward_normalizer(reward)

@@ -32,6 +32,8 @@ data_collection_steps: ${num_env_steps}
 env:
   randomness: low
   task: one_leg
+  stiffness: 1000.0  # Arm joint PD stiffness (Nm/rad) of the diff-IK position drive; paper setting 1000
+  damping: 200.0  # Arm joint PD damping; paper setting 200
 
 actor:
   residual_policy:
@@ -70,6 +72,15 @@ n_iterations_train_only_value: 0
 
 base_bc:
   train_bc: false
+
+# Penalty on excessive force: reward -= coef * max(0, max_j |tau_j| / tau_limit_j - threshold)
+# over the 7 arm joints. coef 0 disables it (paper setting); the torque diagnostics are logged either way.
+safety:
+  torque_penalty_coef: 0.0
+  torque_threshold: 0.5
+  # Fail an episode (no success reward, done) once max_j |tau_j| / tau_limit_j exceeds this
+  # before success. null disables it (paper setting).
+  terminate_torque_ratio: null
 
 # Calculate the batch size as the data collection steps times the number of environments
 batch_size: ${eval:'${data_collection_steps} * ${num_envs}'}

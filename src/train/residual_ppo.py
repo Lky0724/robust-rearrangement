@@ -194,6 +194,8 @@ def main(cfg: DictConfig):
         observation_space="state",
         randomness=cfg.env.randomness,
         max_env_steps=100_000_000,
+        stiffness=cfg.env.get("stiffness", 1000.0),
+        damping=cfg.env.get("damping", 200.0),
     )
 
     n_parts_to_assemble = env.n_parts_assemble
@@ -220,6 +222,9 @@ def main(cfg: DictConfig):
         reset_on_failure=cfg.reset_on_failure,
         reward_clip=cfg.clip_reward,
         sample_perturbations=cfg.sample_perturbations,
+        torque_penalty_coef=cfg.get("safety", {}).get("torque_penalty_coef", 0.0),
+        torque_threshold=cfg.get("safety", {}).get("torque_threshold", 0.5),
+        terminate_torque_ratio=cfg.get("safety", {}).get("terminate_torque_ratio", None),
         device=device,
     )
 
@@ -334,6 +339,14 @@ def main(cfg: DictConfig):
     dones = torch.zeros((steps_per_iteration, cfg.num_envs))
     values = torch.zeros((steps_per_iteration, cfg.num_envs))
 
+    # Raw task reward (before any penalty or normalization), used for success statistics
+    task_rewards = torch.zeros((steps_per_iteration, cfg.num_envs))
+    # Safety diagnostics: max joint torque / limit, and the inserted part's rotation (rad)
+    torque_ratios = torch.zeros((steps_per_iteration, cfg.num_envs))
+    part_rotations = torch.zeros((steps_per_iteration, cfg.num_envs))
+    # Envs failed for exceeding safety.terminate_torque_ratio (latched)
+    force_fails = torch.zeros((steps_per_iteration, cfg.num_envs), dtype=torch.bool)
+
     start_time = time.time()
 
     next_done = torch.zeros(cfg.num_envs)
@@ -393,6 +406,12 @@ def main(cfg: DictConfig):
             actions[step] = residual_naction.cpu()
             logprobs[step] = logprob.cpu()
             rewards[step] = reward.view(-1).cpu()
+            task_rewards[step] = info["task_reward"].view(-1).cpu()
+            if "torque_ratio" in info:
+                torque_ratios[step] = info["torque_ratio"].view(-1).cpu()
+                part_rotations[step] = info["part_rotation"].view(-1).cpu()
+            if "force_failed" in info:
+                force_fails[step] = info["force_failed"].view(-1).cpu()
             next_done = next_done.view(-1).cpu()
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
@@ -401,15 +420,25 @@ def main(cfg: DictConfig):
                 )
 
         # Calculate the success rate
-        # Find the rewards that are not zero
+        # Use the raw task reward, since penalties and normalization change `rewards`
         # Env is successful if it received a reward more than or equal to n_parts_to_assemble
-        env_success = (rewards > 0).sum(dim=0) >= n_parts_to_assemble
+        env_success = (task_rewards > 0).sum(dim=0) >= n_parts_to_assemble
         success_rate = env_success.float().mean().item()
+
+        # Safety diagnostics over all envs and steps of this rollout
+        torque_ratio_mean = torque_ratios.mean().item()
+        torque_ratio_p99 = torch.quantile(torque_ratios.flatten(), 0.99).item()
+        force_fail_rate = force_fails.any(dim=0).float().mean().item()
+        success_part_turns = 0.0
+        # Per-episode peak torque ratio of successful episodes (up to the success step),
+        # used to pick a force threshold that legit episodes stay below
+        peak_tq_thresholds = (0.1, 0.15, 0.2, 0.3)
+        peak_tq_stats = {}
 
         if success_rate > 0:
             # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
             # Count total timesteps in successful trajectories
-            timesteps_in_success = rewards[:, env_success]
+            timesteps_in_success = task_rewards[:, env_success]
 
             # Find index of last reward in each trajectory
             # This has all timesteps including and after episode is done
@@ -427,6 +456,27 @@ def main(cfg: DictConfig):
                 total_timesteps_in_success / env_success.sum().item()
             )
             max_success_episode_length = last_reward_idx.max().item()
+
+            # Rotation of the inserted part from reset up to the success step, in turns
+            rotation_to_success = part_rotations[:, env_success].cumsum(dim=0)
+            rotation_to_success = rotation_to_success.gather(
+                0, last_reward_idx.unsqueeze(0)
+            ).squeeze(0)
+            success_part_turns = (rotation_to_success / (2 * np.pi)).mean().item()
+
+            before_success = (
+                torch.arange(steps_per_iteration).unsqueeze(1)
+                <= last_reward_idx.unsqueeze(0)
+            )
+            peak_tq = (torque_ratios[:, env_success] * before_success).max(dim=0).values
+            for q in (0.5, 0.9, 0.99):
+                peak_tq_stats[f"peak_torque_ratio_p{int(q * 100)}"] = torch.quantile(
+                    peak_tq, q
+                ).item()
+            for thr in peak_tq_thresholds:
+                peak_tq_stats[f"peak_torque_ratio_above_{thr}"] = (
+                    (peak_tq > thr).float().mean().item()
+                )
         else:
             success_timesteps_share = 0
             mean_success_episode_length = 0
@@ -435,7 +485,21 @@ def main(cfg: DictConfig):
         print(
             f"SR: {success_rate:.4%}, SPS: {steps_per_iteration * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
             f", STS: {success_timesteps_share:.4%}, MSEL: {mean_success_episode_length:.2f}"
+            f", TQ p99: {torque_ratio_p99:.3f}, turns: {success_part_turns:.2f}"
+            f", force fail: {force_fail_rate:.2%}"
         )
+        if peak_tq_stats:
+            print(
+                "Success peak TQ p50/p90/p99: "
+                + "/".join(
+                    f"{peak_tq_stats[f'peak_torque_ratio_p{q}']:.3f}" for q in (50, 90, 99)
+                )
+                + ", share above "
+                + ", ".join(
+                    f"{thr}: {peak_tq_stats[f'peak_torque_ratio_above_{thr}']:.1%}"
+                    for thr in peak_tq_thresholds
+                )
+            )
 
         if eval_mode:
             # If we are in eval mode, we don't need to do any training, so log the result and continue
@@ -468,6 +532,12 @@ def main(cfg: DictConfig):
                 {
                     "eval/success_rate": success_rate,
                     "eval/best_eval_success_rate": best_eval_success_rate,
+                    "eval/mean_success_episode_length": mean_success_episode_length,
+                    "eval/torque_ratio_mean": torque_ratio_mean,
+                    "eval/torque_ratio_p99": torque_ratio_p99,
+                    "eval/success_leg_rotation_turns": success_part_turns,
+                    **{f"eval/{k}": v for k, v in peak_tq_stats.items()},
+                    "eval/force_fail_rate": force_fail_rate,
                     "iteration": iteration,
                 },
                 step=global_step,
@@ -627,6 +697,11 @@ def main(cfg: DictConfig):
                 "charts/success_timesteps_share": success_timesteps_share,
                 "charts/mean_success_episode_length": mean_success_episode_length,
                 "charts/max_success_episode_length": max_success_episode_length,
+                "charts/torque_ratio_mean": torque_ratio_mean,
+                "charts/torque_ratio_p99": torque_ratio_p99,
+                "charts/success_leg_rotation_turns": success_part_turns,
+                **{f"charts/{k}": v for k, v in peak_tq_stats.items()},
+                "charts/force_fail_rate": force_fail_rate,
                 "charts/action_norm_mean": action_norms.mean(),
                 "charts/action_norm_std": action_norms.std(),
                 "values/advantages": b_advantages.mean().item(),

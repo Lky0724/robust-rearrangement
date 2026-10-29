@@ -199,6 +199,8 @@ Iteration 2/697, global step 716800, SPS 3452
 | `SPS` (rollout line) | Env steps per second for this rollout only. |
 | `STS` | Success timesteps share: fraction of all collected timesteps that belong to successful episodes (up to the success step). 136 × 531.25 / (700 × 1024) ≈ 10.08%. |
 | `MSEL` | Mean success episode length: average steps a successful env needed, out of 700. |
+| `TQ p99`, `turns`, `force fail` | Safety diagnostics (§4.4): 99th-percentile joint torque as a fraction of its limit; the inserted part's mean rotation (turns) up to success in successful episodes; and the share of envs failed by `safety.terminate_torque_ratio` (0% when it's off). |
+| `Success peak TQ p50/p90/p99 …, share above …` | Printed on the next line when any env succeeded (§4.4): percentiles of the per-episode peak torque ratio over successful episodes, and the share of them above 0.1 / 0.15 / 0.2 / 0.3. |
 | `Policy update 50/50` | PPO epochs. Fewer than 50 means early stopping on KL. |
 | `SPS` (iteration line) | Cumulative steps per second over all training iterations, including update time. |
 
@@ -240,6 +242,68 @@ These ranges are common PPO rules of thumb, not values derived from this repo.
 |---|---|
 | `training/SPS` | Cumulative training steps per second. Use it to estimate remaining time: `(total_timesteps − global_step) / SPS`, plus eval overhead. |
 | GPU memory | Check with `nvidia-smi`, not `torch.cuda.memory_allocated()`. The latter misses PhysX and PyTorch's cache. The example run uses ~7.2 of 8 GB at 1024 envs. |
+
+### 4.4 Tier 4: is the behavior safe? (reward hacking)
+
+A higher SR doesn't guarantee that the behavior is usable. The success check (`_reward()` in `furniture_rl_sim_env.py`) looks only at one instant: the leg's pose relative to the tabletop must be within 1.0 / 0.5 / 1.0 cm (x / vertical / z) and ~20° of the assembled pose. It doesn't check how the leg got there, and once met, success is latched for the rest of the episode. The reward has no term against force or jitter.
+
+**Observed case (`one_leg` med, own BC policy).** From ~200M steps into the `ol-med-own-51-resip-2048-cont` run, the policy stopped screwing the leg in (~2 turns, as in the demos) and instead forced it straight down into the assembled pose. That meets the success check sooner and more often, so PPO favored it: SR rose quickly, and train MSEL fell from ~780 to ~420. In simulation the arm shook violently and the leg was sometimes thrown out. That behavior is unusable on the real robot and for rendering D_synth rollouts.
+
+**Diagnostics** (logged every iteration; `charts/…` for training, `eval/…` for eval):
+
+| Metric | Meaning | Warning sign |
+|---|---|---|
+| `{charts,eval}/torque_ratio_mean` | Mean over steps and envs of max_j \|τ_j\| / limit_j (7 arm joints) | Rising |
+| `{charts,eval}/torque_ratio_p99` | 99th percentile of the same (peaks) | Rising clearly. Also printed as `TQ p99` on the `SR:` line. |
+| `{charts,eval}/success_leg_rotation_turns` | In successful episodes, total rotation of the inserted part from reset to the success step, in turns. Counts rotation in any direction, so tumbling adds to it too. | Falling well below the demos' ~2 turns. Also printed as `turns`. |
+| `eval/mean_success_episode_length` | Eval MSEL (training MSEL is `charts/mean_success_episode_length`) | A sudden large drop |
+| `{charts,eval}/peak_torque_ratio_p{50,90,99}` | For each successful episode, the peak torque ratio from reset up to the success step; then the 50th/90th/99th percentile over those episodes | Rising. Printed as `Success peak TQ p50/p90/p99` on the line after `SR:`. |
+| `{charts,eval}/peak_torque_ratio_above_{0.1,0.15,0.2,0.3}` | Share of successful episodes whose peak exceeds that threshold | Shows how much clean and hacking episodes overlap (below) |
+
+The arm has gravity disabled in simulation, so the measured joint torques come only from contact and from accelerating the arm. They stay small in smooth free motion.
+
+**Measured values** (`one_leg` med, own BC policy, iteration-1 eval with deterministic actions):
+
+| Policy | SR | MSEL | `TQ p99` | `turns` |
+|---|---|---|---|---|
+| Base only | 11.3% | 856 | 0.031 | 1.84 |
+| Clean residual (`-resip-2048`) | 40.3% | 789 | 0.042 | 1.88 |
+| Hacking residual (`-cont2`) | 85.6% | 333 | 0.126 | 0.82 |
+
+**Measuring a checkpoint.** Start a run from it with `actor.residual_policy.pretrained_wts=<ckpt>` and `debug=true`. Read both the iteration-1 eval and the iteration-2 training rollout, because training uses sampled actions and produces higher torques than eval. Compare a clean checkpoint with a hacking one.
+
+**Lesson from the torque penalty.** A run from the clean checkpoint with `safety.torque_threshold=0.06 safety.torque_penalty_coef=0.5` (`ol-med-own-51-resip-2048-tq`) fell from 42% to 15% SR over 176 iterations, while the same start without the penalty rose. The threshold had been set from eval `TQ p99` values, but training's `TQ p99` was already 0.057. Contact torques peak during legitimate insertion too, so the penalty taught the policy to back off from contact. Calibrate on per-episode peaks from training rollouts instead.
+
+**Per-episode peaks** (successful episodes, share whose peak `torque_ratio` exceeds each threshold):
+
+| Threshold | Clean, eval | Clean, training | Hacking, eval | Hacking, training |
+|---|---|---|---|---|
+| 0.1 | 57.3% | 86.4% | 92.2% | 97.9% |
+| 0.15 | 29.5% | 60.5% | 71.6% | 86.5% |
+| 0.2 | 16.6% | 41.5% | 50.4% | 72.4% |
+| 0.3 | 7.6% | 21.5% | 26.4% | 46.9% |
+
+The distributions overlap heavily, because legitimate episodes also have short torque spikes (grasp impacts, contact, wrist at a joint limit). Peaks reach 1.0–2.0, i.e. above the real arm's limits. Half of the hacking successes stay below 0.2 in eval, so forcing the leg in doesn't need a large torque.
+
+**Lesson from force failure.** A run from the clean checkpoint with `safety.terminate_torque_ratio=0.2` (`ol-med-own-51-resip-2048-ff02`, 193 iterations) failed. The best checkpoint was the starting one.
+
+| Eval iteration | Eval SR | Eval MSEL | Eval `turns` | Eval `force fail` | Training `force fail` (mean over iterations) |
+|---|---|---|---|---|---|
+| 1 | 33.5% | 788 | 1.88 | 15.9% | 40.1% (2–11) |
+| 61 | 24.5% | 770 | 1.87 | 18.0% | 41.6% (56–66) |
+| 116 | 20.3% | 708 | 1.69 | 19.8% | 44.4% (111–121) |
+| 191 | 15.1% | 602 | 1.28 | 22.4% | 47.6% (182–193) |
+
+Two things went wrong:
+
+- **The failures weren't learnable.** Training failed 2–2.5× as many episodes as eval, so most failures came from exploration noise: with stiffness 1000, a small jitter in the target becomes a torque spike. The noise level is fixed (`learn_std: false`), so the policy couldn't avoid them, and the training failure share never fell.
+- **Hacking came back under the threshold.** The only learnable signal left was the discount's reward for finishing sooner. MSEL and `turns` fell toward the hacking values, while successful episodes' peaks crept up to just below 0.2.
+
+Joint torque doesn't separate forcing from screwing, whether as a penalty or as a failure condition, so neither is recommended against hacking. The quantities that do separate them are `turns` and MSEL. A stricter success check based on the leg's signed rotation about its own axis is a candidate fix; it isn't implemented. Use the signed net rotation, because the logged `turns` sums absolute per-step rotation, which training-time jitter inflates (2.6 in training vs 1.9 in eval for the clean checkpoint).
+
+**Lowering the stiffness** (`env.stiffness`, §7.3) shrinks the torque spikes caused by exploration noise and brings the sim closer to the real robot's joint gains (`Kq` 40–160). It doesn't bound the force by itself: the residual is unbounded, so the policy can place the target further below the part to push just as hard. Check the base policy's SR at the new stiffness before training with it.
+
+Also use `checkpoint_interval` (§5) during long runs, so you can go back to a checkpoint from before any hacking.
 
 ---
 
@@ -360,6 +424,7 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 |---|---|---|---|
 | `env.task` | `one_leg` | — | See 7.1. |
 | `env.randomness` | `low` | — | See 7.1. |
+| `env.stiffness` / `env.damping` | 1000 / 200 | Not listed (the code's 1000 / 200 were used) | PD gains of the 7 arm joints' position drives, which track the diff-IK joint targets. The real robot's polymetis joint impedance uses `Kq` 40–160 (`src/real/minimal.py`), so the sim arm is 6–25× stiffer and can push harder for the same target offset. Lowering it makes forcing parts harder but slows tracking, which can lower π_base's SR, since the demos were collected at 1000. Rollouts saved for rendering and distillation must come from the same stiffness; `evaluate_model.py` still uses 1000. |
 | `control.controller` | `diffik` | — | Low-level controller that turns end-effector targets into joint commands. Must match π_base. |
 | `control.control_mode` | `pos` | Absolute EE pose | `pos` = absolute pose actions, `delta` = relative. Must match π_base. |
 | `control.act_rot_repr` | `rot_6d` | 6D | Rotation representation in the 10-D action. Must match π_base. |
@@ -450,6 +515,9 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 |---|---|---|
 | `normalize_reward` | `true` | Divide each reward by a running std, without subtracting the mean, so 0 stays 0. A sparse +1 becomes ≈ 4–5 early in training. |
 | `clip_reward` | 5.0 | Clip the normalized reward to ±5. |
+| `safety.torque_penalty_coef` | 0.0 | Weight of the excessive-force penalty (§4.4). Each step, `reward -= coef × max(0, torque_ratio − threshold)`, applied before normalization. 0 = off, which is the paper setting. SR, STS and MSEL are always computed from the raw task reward, so the penalty doesn't affect them. Not recommended against hacking (§4.4). |
+| `safety.torque_threshold` | 0.5 | `torque_ratio` below this isn't penalized. `torque_ratio` = max over the 7 arm joints of \|τ\| / limit (87 Nm for joints 1–4, 12 Nm for 5–7). Compare a clean and a hacking checkpoint before picking it (§4.4). |
+| `safety.terminate_torque_ratio` | `null` | Force failure (§4.4). Once `torque_ratio` exceeds this before success, the episode fails: it's done from then on and gets no success reward, even if the part reaches the assembled pose later. Spikes after success are ignored. `null` = off, which is the paper setting. Failed episodes count as failures in SR; the share is logged as `{charts,eval}/force_fail_rate` and printed as `force fail`. Not recommended against hacking: 0.2 lowered SR and didn't stop it (§4.4). Usable only as a coarse safety cap. |
 
 ### 7.10 Settings of the released residual checkpoints
 

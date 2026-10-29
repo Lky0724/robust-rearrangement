@@ -110,6 +110,8 @@ def get_rl_env(
     concat_robot_state=False,
     ctrl_mode="diffik",
     obs_keys=None,
+    stiffness=1000.0,  # Arm joint PD stiffness of the diff-IK position drive
+    damping=200.0,  # Arm joint PD damping
     **kwargs,
 ):
 
@@ -173,6 +175,8 @@ def get_rl_env(
                 ctrl_mode="diffik",  # Control mode for the robot. Options are 'osc' and 'diffik'.
                 action_type=action_type,  # Action type for the robot. Options are 'delta' and 'pos'.
                 verbose=verbose,  # If true, prints debug information.
+                stiffness=stiffness,  # Arm joint PD stiffness.
+                damping=damping,  # Arm joint PD damping.
                 # **kwargs,
             )
 
