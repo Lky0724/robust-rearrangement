@@ -190,6 +190,27 @@ class RunningMeanStdClip:
         return torch.clamp(x_normalized, -self.clip_value, self.clip_value)
 
 
+def _quat_conj(q: torch.Tensor) -> torch.Tensor:
+    """Conjugate of xyzw quaternions."""
+    return torch.cat([-q[..., :3], q[..., 3:]], dim=-1)
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of xyzw quaternions."""
+    av, aw = a[..., :3], a[..., 3:]
+    bv, bw = b[..., :3], b[..., 3:]
+    v = aw * bv + bw * av + torch.cross(av, bv, dim=-1)
+    w = aw * bw - (av * bv).sum(dim=-1, keepdim=True)
+    return torch.cat([v, w], dim=-1)
+
+
+def _quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate vectors v by xyzw quaternions q."""
+    qv, qw = q[..., :3], q[..., 3:]
+    t = 2.0 * torch.cross(qv, v, dim=-1)
+    return v + qw * t + torch.cross(qv, t, dim=-1)
+
+
 class RLPolicyEnvWrapper:
 
     def __init__(
@@ -204,6 +225,7 @@ class RLPolicyEnvWrapper:
         torque_penalty_coef=0.0,
         torque_threshold=0.5,
         terminate_torque_ratio=None,
+        min_insert_twist_turns=None,
         device="cuda",
     ):
         self.env = env
@@ -222,17 +244,23 @@ class RLPolicyEnvWrapper:
         # robot pushes against something (e.g. forcing a part into place).
         self.torque_penalty_coef = torque_penalty_coef
         self.torque_threshold = torque_threshold
-        self.track_safety = hasattr(self.env, "forces") and hasattr(
-            self.env, "pairs_to_assemble"
+        self.track_safety = all(
+            hasattr(self.env, attr)
+            for attr in ("forces", "pairs_to_assemble", "get_ee_pose", "act_low")
         )
         if self.track_safety:
             # Franka joint torque limits (Nm) for joints 1-7
             self.torque_limits = torch.tensor(
                 [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], device=self.device
             )
-            # Part that gets inserted/screwed: second part of the first assembly pair
+            # Part that gets inserted/screwed: second part of the first assembly pair,
+            # and the part it goes into: the first one
             self.tracked_part_idx = self.env.pairs_to_assemble[0][1]
+            self.base_part_idx = self.env.pairs_to_assemble[0][0]
+            # Long axis of the tracked part in its mesh frame (square_table legs: local y)
+            self.part_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
         self.prev_part_quat = None
+        self.prev_rel_quat = None
 
         # Fail an episode once its torque ratio exceeds this value before success.
         # The failure is latched: the env stays done and gets no success reward.
@@ -241,6 +269,19 @@ class RLPolicyEnvWrapper:
             self.env.num_envs, device=self.device, dtype=torch.bool
         )
         self.succeeded = torch.zeros_like(self.force_failed)
+
+        # Stricter success check: the tracked part must twist at least this many turns about
+        # its long axis while within `insert_radius` of an assembled position. Otherwise the
+        # assembled pose was reached by forcing the part in, and the episode fails (latched).
+        self.min_insert_twist_turns = min_insert_twist_turns
+        self.insert_radius = 0.03  # the threads span the last ~2 cm
+        if self.min_insert_twist_turns is not None:
+            if not self.track_safety:
+                raise ValueError("min_insert_twist_turns needs an env with part and EE states")
+            # Assembled positions of the tracked part in the base part's frame
+            self.assembled_pos = self.env.assembled_rel_poses[0, :, :3, 3].to(self.device)
+        self.insert_twist = torch.zeros(self.env.num_envs, device=self.device)
+        self.twist_failed = torch.zeros_like(self.force_failed)
 
         self.env_success = torch.zeros(
             self.env.num_envs, device=self.device, dtype=torch.bool
@@ -275,10 +316,13 @@ class RLPolicyEnvWrapper:
         )
         # Re-read the tracked part's orientation on the first step after a reset
         self.prev_part_quat = None
+        self.prev_rel_quat = None
         self.force_failed = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
         self.succeeded = torch.zeros_like(self.force_failed)
+        self.insert_twist = torch.zeros(self.num_envs, device=self.device)
+        self.twist_failed = torch.zeros_like(self.force_failed)
         return obs
 
     def _safety_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -306,8 +350,36 @@ class RLPolicyEnvWrapper:
 
         return torque_ratio, part_rotation
 
+    def _part_twist(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Signed rotation (rad) of the tracked part about its long axis since the
+        previous step, relative to the base part, and the tracked part's position
+        in the base part's frame."""
+        states = self.env.rb_states[self.env.furniture_rb_indices]
+        part = states[:, self.tracked_part_idx]
+        base = states[:, self.base_part_idx]
+        base_quat_inv = _quat_conj(base[:, 3:7])
+        rel_quat = _quat_mul(base_quat_inv, part[:, 3:7])
+        rel_pos = _quat_rotate(base_quat_inv, part[:, :3] - base[:, :3])
+
+        if self.prev_rel_quat is None:
+            twist = torch.zeros(self.num_envs, device=self.device)
+        else:
+            # Rotation since the previous step, in the tracked part's own frame
+            dq = _quat_mul(_quat_conj(self.prev_rel_quat), rel_quat)
+            dq = dq * torch.where(dq[:, 3:4] < 0, -1.0, 1.0)
+            # Twist component about the long axis (swing-twist decomposition).
+            # Signed, so back-and-forth jitter cancels out when summed.
+            twist = 2.0 * torch.atan2((dq[:, :3] * self.part_axis).sum(dim=-1), dq[:, 3])
+        self.prev_rel_quat = rel_quat
+
+        return twist, rel_pos
+
     def step(self, action: torch.Tensor):
         assert action.shape[1:] == self.action_space.shape
+
+        if self.track_safety:
+            # End-effector position the step's target is set from
+            ee_pos_before = self.env.get_ee_pose()[0].clone()
 
         # Move the robot
         obs, reward, termination, info = self.env.step(
@@ -320,6 +392,13 @@ class RLPolicyEnvWrapper:
             torque_ratio, part_rotation = self._safety_stats()
             info["torque_ratio"] = torque_ratio
             info["part_rotation"] = part_rotation
+            info["part_twist"], info["part_rel_pos"] = self._part_twist()
+            # Target position (as clipped by the env) minus the end-effector position.
+            # The arm's PD drive pushes toward it, so a large offset means a large force.
+            target_pos = torch.clamp(
+                action[:, :3], self.env.act_low[..., :3], self.env.act_high[..., :3]
+            )
+            info["ee_goal_offset"] = target_pos - ee_pos_before
 
             if self.terminate_torque_ratio is not None:
                 # Only count steps before success; a failed env never succeeds later
@@ -330,6 +409,25 @@ class RLPolicyEnvWrapper:
                 reward = torch.where(self.force_failed, 0.0, reward)
                 termination = termination | self.force_failed
                 info["force_failed"] = self.force_failed.clone()
+
+            if self.min_insert_twist_turns is not None:
+                inserting = (
+                    (info["part_rel_pos"].unsqueeze(1) - self.assembled_pos)
+                    .norm(dim=-1)
+                    .min(dim=1)
+                    .values
+                    < self.insert_radius
+                )
+                self.insert_twist += torch.where(inserting, info["part_twist"], 0.0)
+                # Checked on the step the env reports the part as newly assembled (reward > 0).
+                # The env stays done afterwards and pays that reward only once, so a failed
+                # env gets no success reward. Magnitude only, so the check doesn't depend on
+                # the threads' handedness or the axis' sign convention.
+                self.twist_failed |= (reward > 0) & (
+                    self.insert_twist.abs() < self.min_insert_twist_turns * 2 * torch.pi
+                )
+                reward = torch.where(self.twist_failed, 0.0, reward)
+                info["twist_failed"] = self.twist_failed.clone()
 
         # Keep the task reward (0/1 per assembled pair, minus force failures) for success statistics
         info["task_reward"] = reward.clone()

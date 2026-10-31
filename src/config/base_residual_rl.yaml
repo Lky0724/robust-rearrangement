@@ -81,6 +81,11 @@ safety:
   # Fail an episode (no success reward, done) once max_j |tau_j| / tau_limit_j exceeds this
   # before success. null disables it (paper setting).
   terminate_torque_ratio: null
+  # Success also requires the inserted part to twist at least this many turns about its long
+  # axis while within 3 cm of an assembled position; otherwise the episode fails (no success
+  # reward, done). Screwing the leg in takes ~1.19 turns, forcing it in ~0.26 (one_leg).
+  # null disables it (paper setting).
+  min_insert_twist_turns: null
 
 # Calculate the batch size as the data collection steps times the number of environments
 batch_size: ${eval:'${data_collection_steps} * ${num_envs}'}

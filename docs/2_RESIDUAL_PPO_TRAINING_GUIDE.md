@@ -199,8 +199,11 @@ Iteration 2/697, global step 716800, SPS 3452
 | `SPS` (rollout line) | Env steps per second for this rollout only. |
 | `STS` | Success timesteps share: fraction of all collected timesteps that belong to successful episodes (up to the success step). 136 × 531.25 / (700 × 1024) ≈ 10.08%. |
 | `MSEL` | Mean success episode length: average steps a successful env needed, out of 700. |
-| `TQ p99`, `turns`, `force fail` | Safety diagnostics (§4.4): 99th-percentile joint torque as a fraction of its limit; the inserted part's mean rotation (turns) up to success in successful episodes; and the share of envs failed by `safety.terminate_torque_ratio` (0% when it's off). |
+| `TQ p99`, `turns`, `force fail`, `twist fail` | Safety diagnostics (§4.4): 99th-percentile joint torque as a fraction of its limit; the inserted part's mean rotation (turns) up to success in successful episodes; and the shares of envs failed by `safety.terminate_torque_ratio` and by `safety.min_insert_twist_turns` (0% when off). |
 | `Success peak TQ p50/p90/p99 …, share above …` | Printed on the next line when any env succeeded (§4.4): percentiles of the per-episode peak torque ratio over successful episodes, and the share of them above 0.1 / 0.15 / 0.2 / 0.3. |
+| `Success insertion (within 3 cm): twist turns …` | Printed when any env succeeded (§4.4): the inserted part's signed twist about its long axis, relative to the base part, during insertion (steps up to success while the part is within 3 cm of its final position); p10/p50/p90 over successful episodes, the share with \|twist\| ≥ 1 / 1.5 turns, the median net twist from reset, and the mean number of insertion steps. |
+| `Success target below EE in insertion …` | Printed when any env succeeded (§4.4): per-episode peak of how far the position target sits below the end effector during insertion (mm, p50/p90/p99), mean steps with it more than 5 mm below, and the 99th percentile of the full target–EE offset up to success. |
+| `Success smoothness (mm/step) …` | Printed when any env succeeded (§4.4), over successful episodes up to the success step: mean change of the position target per step, by the step's position in the base's action chunk (0 = the base just started a new chunk, up to `action_horizon` − 1); mean second difference (stop-and-go) of the target and of the end-effector position; and of the target's base and residual parts. |
 | `Policy update 50/50` | PPO epochs. Fewer than 50 means early stopping on KL. |
 | `SPS` (iteration line) | Cumulative steps per second over all training iterations, including update time. |
 
@@ -259,6 +262,12 @@ A higher SR doesn't guarantee that the behavior is usable. The success check (`_
 | `eval/mean_success_episode_length` | Eval MSEL (training MSEL is `charts/mean_success_episode_length`) | A sudden large drop |
 | `{charts,eval}/peak_torque_ratio_p{50,90,99}` | For each successful episode, the peak torque ratio from reset up to the success step; then the 50th/90th/99th percentile over those episodes | Rising. Printed as `Success peak TQ p50/p90/p99` on the line after `SR:`. |
 | `{charts,eval}/peak_torque_ratio_above_{0.1,0.15,0.2,0.3}` | Share of successful episodes whose peak exceeds that threshold | Shows how much clean and hacking episodes overlap (below) |
+| `{charts,eval}/insert_twist_turns_p{10,50,90}`, `insert_twist_abs_above_{1.0,1.5}` | Signed twist of the inserted part about its long axis (the leg mesh's local y), relative to the base part, during insertion: steps up to success while the part is within 3 cm of its final position. Back-and-forth jitter cancels, unlike `turns`. | Falling toward 0. Used to pick the turn requirement of a stricter success check. |
+| `{charts,eval}/net_twist_turns_p50`, `insert_steps` | Median signed twist from reset to success; mean number of insertion steps | `insert_steps` dropping sharply (pushed through instead of screwed) |
+| `{charts,eval}/insert_down_offset_mm_p{50,90,99}`, `insert_steps_down_offset_above_5mm` | How far the position target sits below the end effector during insertion: per-episode peak (mm), and mean steps above 5 mm. The PD drive pushes toward the target, so this sets the downward force (≈ stiffness × offset). | Rising. Used to pick a cap on the offset. |
+| `{charts,eval}/offset_mm_p99` | 99th percentile of the full target–EE offset (mm) up to success | A cap below this would also slow legitimate motion |
+| `{charts,eval}/target_step_mm_phase{0..7}` | Mean change of the position target per step (mm) in successful episodes up to success, by the step's position in the base's action chunk (0 = new chunk) | Phase 0 above the rest: a surge at every replanning. All phases well above the base policy's: back-and-forth at every step |
+| `{charts,eval}/target_jerk_mm`, `ee_jerk_mm`, `base_target_jerk_mm`, `residual_jerk_mm` | Mean second difference (mm/step²) of the target, the end-effector position, and the target's base and residual parts, in successful episodes up to success | Well above the base policy's values; residual part well above the base part: the residual causes the stop-and-go motion |
 
 The arm has gravity disabled in simulation, so the measured joint torques come only from contact and from accelerating the arm. They stay small in smooth free motion.
 
@@ -299,7 +308,33 @@ Two things went wrong:
 - **The failures weren't learnable.** Training failed 2–2.5× as many episodes as eval, so most failures came from exploration noise: with stiffness 1000, a small jitter in the target becomes a torque spike. The noise level is fixed (`learn_std: false`), so the policy couldn't avoid them, and the training failure share never fell.
 - **Hacking came back under the threshold.** The only learnable signal left was the discount's reward for finishing sooner. MSEL and `turns` fell toward the hacking values, while successful episodes' peaks crept up to just below 0.2.
 
-Joint torque doesn't separate forcing from screwing, whether as a penalty or as a failure condition, so neither is recommended against hacking. The quantities that do separate them are `turns` and MSEL. A stricter success check based on the leg's signed rotation about its own axis is a candidate fix; it isn't implemented. Use the signed net rotation, because the logged `turns` sums absolute per-step rotation, which training-time jitter inflates (2.6 in training vs 1.9 in eval for the clean checkpoint).
+Joint torque doesn't separate forcing from screwing, whether as a penalty or as a failure condition, so neither is recommended against hacking.
+
+**Twist, target offset and smoothness** (`one_leg` med, own BC policy; iteration-1 eval with deterministic actions, iteration-2 training in brackets):
+
+| | Base only | Clean (`-resip-2048`) | Hacking (`-cont2`) |
+|---|---|---|---|
+| Insertion twist p10/p50/p90 (turns) | −1.20/−1.19/−1.18 | −1.20/−1.19/−1.18 | −0.27/−0.26/−0.24 |
+| Share with \|twist\| ≥ 1 turn | 98.8% (85.0%) | 99.2% (97.6%) | 0.2% (0.6%) |
+| Insertion steps | 495 | 468 | 122 |
+| Peak target below EE in insertion, p50/p90/p99 (mm) | 15.9/23.4/30.6 (25.8/32.9/37.3) | 21.7/30.4/37.4 (29.6/37.0/45.1) | 76.2/86.7/98.5 (77.3/94.1/108.7) |
+| \|offset\| p99 up to success (mm) | 22 (33) | 30 (37) | 63 (67) |
+| EE second difference, successful episodes (mm/step²)¹ | 0.73 | 1.30 | 4.11 |
+| Target second difference, successful episodes (mm/step²)¹ | 2.05 | 4.52 | 17.52 |
+| Target step by chunk phase 0 / 1 / 2 / 7, successful episodes (mm)¹ | 3.43 / 2.43 / 2.42 / 2.40 | 6.82 / 4.59 / 3.65 / 3.23 | 20.4 / 14.8 / 12.3 / 8.1 |
+| Lag-1 autocorrelation of the target's per-step motion, successful episodes¹ | +0.61 | +0.18 | −0.32 |
+| EE rotation second difference, successful episodes (°/step²)¹ | 0.52 | 0.58 | 1.38 |
+
+¹ From the successful episodes saved by `src/eval/evaluate_model.py --save-rollouts` (base 3, clean 18, hacking 16 episodes; few for the base). The saved `actions` are deltas (target − EE pose), so the target is rebuilt as EE + delta. An earlier version of the smoothness metrics averaged over all running envs, including failed episodes that jitter in place; that hid most of the difference (EE 1.66 base vs 1.87 clean). The metrics now cover successful episodes only.
+
+- **Twist separates the two completely.** Every legitimate success twists ~1.19 turns, every forced one ~0.26. The success check (`_reward()` in `furniture_rl_sim_env.py`) requires the leg's orientation relative to the tabletop to be within ~20° of the assembled one (`ori_bound` 0.94), so the twist can only be about 0.26 + k turns. Forcing is k = 0: it skips one full turn of the thread.
+- `turns` doesn't separate them as well (1.88 vs 0.81), because it also counts rotation during grasping and transport, and jitter.
+- Forcing places the target ~76 mm below the end effector, 3.5× the clean policy's ~22 mm.
+- In successful episodes, the clean policy's end-effector position is 1.8× less smooth than the base's and the hacking policy's 5.6×; rotation differs much less (+12% for clean). The clean target moves 1.6× as far per step as the base's (3.9 vs 2.5 mm), its end effector only 1.3×, so much of the extra target motion is back-and-forth that the PD drive filters.
+- **The PPO targets zigzag.** The base's consecutive target steps keep their direction (autocorrelation +0.61); the clean policy's barely do (+0.18), and the hacking policy's tend to reverse (−0.32). Each base chunk also starts with a surge (3.4 vs ~2.4 mm), which the residual amplifies, but the extra motion is at every step, not only at the chunk start.
+- The jitter grows over training without forcing too (R6 in the [problem analysis](2b_RESIDUAL_PPO_PROBLEM_ANALYSIS.md)): the residual's part grows while the base's stays constant.
+
+**Stricter success check** (`safety.min_insert_twist_turns`, §7.9). The wrapper sums the twist while the leg is within 3 cm of an assembled position (`assembled_rel_poses`, the same poses the success check uses). When the env reports the leg as assembled, it fails the episode if the summed |twist| is below the threshold: no success reward, and done. Failures count against SR and are logged as `{charts,eval}/twist_fail_rate`. 0.75 lies midway between 0.26 and 1.19 and means "screwed in at least one full turn". The reward stays sparse; this only corrects what counts as a success. Verified on `one_leg` med (R6 in the [problem analysis](2b_RESIDUAL_PPO_PROBLEM_ANALYSIS.md)): continuing from the clean checkpoint for 612 iterations, the twist stayed at −1.19 turns and eval SR rose from 39% to ~64%, while the same run without the check started forcing at ~iteration 150.
 
 **Lowering the stiffness** (`env.stiffness`, §7.3) shrinks the torque spikes caused by exploration noise and brings the sim closer to the real robot's joint gains (`Kq` 40–160). It doesn't bound the force by itself: the residual is unbounded, so the policy can place the target further below the part to push just as hard. Check the base policy's SR at the new stiffness before training with it.
 
@@ -518,6 +553,7 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 | `safety.torque_penalty_coef` | 0.0 | Weight of the excessive-force penalty (§4.4). Each step, `reward -= coef × max(0, torque_ratio − threshold)`, applied before normalization. 0 = off, which is the paper setting. SR, STS and MSEL are always computed from the raw task reward, so the penalty doesn't affect them. Not recommended against hacking (§4.4). |
 | `safety.torque_threshold` | 0.5 | `torque_ratio` below this isn't penalized. `torque_ratio` = max over the 7 arm joints of \|τ\| / limit (87 Nm for joints 1–4, 12 Nm for 5–7). Compare a clean and a hacking checkpoint before picking it (§4.4). |
 | `safety.terminate_torque_ratio` | `null` | Force failure (§4.4). Once `torque_ratio` exceeds this before success, the episode fails: it's done from then on and gets no success reward, even if the part reaches the assembled pose later. Spikes after success are ignored. `null` = off, which is the paper setting. Failed episodes count as failures in SR; the share is logged as `{charts,eval}/force_fail_rate` and printed as `force fail`. Not recommended against hacking: 0.2 lowered SR and didn't stop it (§4.4). Usable only as a coarse safety cap. |
+| `safety.min_insert_twist_turns` | `null` | Stricter success check (§4.4). Success also requires the inserted part to twist at least this many turns about its long axis (magnitude, relative to the base part) while within 3 cm of an assembled position; otherwise the episode fails: no success reward, done. `null` = off, which is the paper setting. For `one_leg`, 0.75 separates screwing (~1.19 turns) from forcing (~0.26). Logged as `{charts,eval}/twist_fail_rate`, printed as `twist fail`. Applies to the first assembly pair only, and assumes the part's long axis is its mesh's local y (square_table legs). |
 
 ### 7.10 Settings of the released residual checkpoints
 

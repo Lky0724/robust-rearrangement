@@ -225,6 +225,7 @@ def main(cfg: DictConfig):
         torque_penalty_coef=cfg.get("safety", {}).get("torque_penalty_coef", 0.0),
         torque_threshold=cfg.get("safety", {}).get("torque_threshold", 0.5),
         terminate_torque_ratio=cfg.get("safety", {}).get("terminate_torque_ratio", None),
+        min_insert_twist_turns=cfg.get("safety", {}).get("min_insert_twist_turns", None),
         device=device,
     )
 
@@ -346,6 +347,18 @@ def main(cfg: DictConfig):
     part_rotations = torch.zeros((steps_per_iteration, cfg.num_envs))
     # Envs failed for exceeding safety.terminate_torque_ratio (latched)
     force_fails = torch.zeros((steps_per_iteration, cfg.num_envs), dtype=torch.bool)
+    # Envs failed by safety.min_insert_twist_turns: assembled without enough twist (latched)
+    twist_fails = torch.zeros((steps_per_iteration, cfg.num_envs), dtype=torch.bool)
+    # Motion diagnostics: inserted part's signed twist about its long axis (rad) and its
+    # position in the base part's frame (m); target position, the base policy's target
+    # and target - end-effector offset (m)
+    part_twists = torch.zeros((steps_per_iteration, cfg.num_envs))
+    part_rel_pos = torch.zeros((steps_per_iteration, cfg.num_envs, 3))
+    target_pos = torch.zeros((steps_per_iteration, cfg.num_envs, 3))
+    base_target_pos = torch.zeros((steps_per_iteration, cfg.num_envs, 3))
+    ee_goal_offsets = torch.zeros((steps_per_iteration, cfg.num_envs, 3))
+    # Steps where the base policy started a new action chunk
+    chunk_starts = torch.zeros(steps_per_iteration, dtype=torch.bool)
 
     start_time = time.time()
 
@@ -378,7 +391,9 @@ def main(cfg: DictConfig):
                 # Only count environment steps during training
                 global_step += cfg.num_envs
 
-            # Get the base normalized action
+            # Get the base normalized action (a new chunk is predicted when the queue is empty)
+            # (same check as Actor.action; the queue is None before the first prediction)
+            chunk_starts[step] = not agent.actions
             base_naction = agent.base_action_normalized(next_obs)
 
             # Process the obs for the residual policy
@@ -397,6 +412,10 @@ def main(cfg: DictConfig):
             naction = base_naction + residual_naction * residual_policy.action_scale
 
             action = agent.normalizer(naction, "action", forward=False)
+            target_pos[step] = action[:, :3].cpu()
+            base_target_pos[step] = agent.normalizer(
+                base_naction, "action", forward=False
+            )[:, :3].cpu()
             next_obs, reward, next_done, truncated, info = env.step(action)
 
             if cfg.truncation_as_done:
@@ -410,8 +429,13 @@ def main(cfg: DictConfig):
             if "torque_ratio" in info:
                 torque_ratios[step] = info["torque_ratio"].view(-1).cpu()
                 part_rotations[step] = info["part_rotation"].view(-1).cpu()
+                part_twists[step] = info["part_twist"].view(-1).cpu()
+                part_rel_pos[step] = info["part_rel_pos"].cpu()
+                ee_goal_offsets[step] = info["ee_goal_offset"].cpu()
             if "force_failed" in info:
                 force_fails[step] = info["force_failed"].view(-1).cpu()
+            if "twist_failed" in info:
+                twist_fails[step] = info["twist_failed"].view(-1).cpu()
             next_done = next_done.view(-1).cpu()
 
             if step > 0 and (env_step := step * 1) % 100 == 0:
@@ -429,11 +453,18 @@ def main(cfg: DictConfig):
         torque_ratio_mean = torque_ratios.mean().item()
         torque_ratio_p99 = torch.quantile(torque_ratios.flatten(), 0.99).item()
         force_fail_rate = force_fails.any(dim=0).float().mean().item()
+        twist_fail_rate = twist_fails.any(dim=0).float().mean().item()
         success_part_turns = 0.0
         # Per-episode peak torque ratio of successful episodes (up to the success step),
         # used to pick a force threshold that legit episodes stay below
         peak_tq_thresholds = (0.1, 0.15, 0.2, 0.3)
         peak_tq_stats = {}
+        # Twist and target offset during insertion in successful episodes
+        twist_thresholds = (1.0, 1.5)
+        insert_stats = {}
+
+        # Smoothness of successful episodes up to the success step
+        smooth_stats = {}
 
         if success_rate > 0:
             # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
@@ -477,6 +508,80 @@ def main(cfg: DictConfig):
                 peak_tq_stats[f"peak_torque_ratio_above_{thr}"] = (
                     (peak_tq > thr).float().mean().item()
                 )
+
+            # Insertion: steps up to success where the part is within 3 cm of its final
+            # position relative to the base part (the threads span the last ~2 cm)
+            rel_pos = part_rel_pos[:, env_success]
+            final_rel_pos = rel_pos.gather(
+                0, last_reward_idx.view(1, -1, 1).expand(1, -1, 3)
+            )
+            inserting = before_success & (
+                (rel_pos - final_rel_pos).norm(dim=-1) < 0.03
+            )
+            twists = part_twists[:, env_success]
+            insert_turns = (twists * inserting).sum(dim=0) / (2 * np.pi)
+            net_turns = (twists * before_success).sum(dim=0) / (2 * np.pi)
+            for q in (0.1, 0.5, 0.9):
+                insert_stats[f"insert_twist_turns_p{int(q * 100)}"] = torch.quantile(
+                    insert_turns, q
+                ).item()
+            for thr in twist_thresholds:
+                insert_stats[f"insert_twist_abs_above_{thr}"] = (
+                    (insert_turns.abs() >= thr).float().mean().item()
+                )
+            insert_stats["net_twist_turns_p50"] = torch.quantile(net_turns, 0.5).item()
+            insert_stats["insert_steps"] = inserting.sum(dim=0).float().mean().item()
+
+            # How far below the end effector the target was placed (positive = below)
+            offsets = ee_goal_offsets[:, env_success]
+            down_offset = -offsets[..., 2]
+            peak_down_mm = (down_offset * inserting).max(dim=0).values * 1000
+            for q in (0.5, 0.9, 0.99):
+                insert_stats[f"insert_down_offset_mm_p{int(q * 100)}"] = torch.quantile(
+                    peak_down_mm, q
+                ).item()
+            insert_stats["insert_steps_down_offset_above_5mm"] = (
+                ((down_offset > 0.005) & inserting).sum(dim=0).float().mean().item()
+            )
+            insert_stats["offset_mm_p99"] = torch.quantile(
+                offsets.norm(dim=-1)[before_success] * 1000, 0.99
+            ).item()
+
+            # Smoothness in mm per step: change of the target between steps, by the step's
+            # position in the base's action chunk (0 = the base just started a new chunk),
+            # and second differences (stop-and-go) of the target, its base and residual
+            # parts, and the end-effector position. Failed episodes are left out, since
+            # they can jitter in place and would mask the difference between policies.
+            def step_change_mm(x):
+                return (x[1:] - x[:-1]).norm(dim=-1) * 1000
+
+            def second_diff_mm(x):
+                return (x[2:] - 2 * x[1:-1] + x[:-2]).norm(dim=-1) * 1000
+
+            succ_target = target_pos[:, env_success]
+            succ_base = base_target_pos[:, env_success]
+            succ_ee = succ_target - offsets
+            d1_valid = before_success[1:]
+            d2_valid = before_success[2:]
+
+            steps = torch.arange(steps_per_iteration)
+            last_chunk_start = torch.cummax(
+                torch.where(chunk_starts, steps, 0), dim=0
+            ).values
+            chunk_phase = (steps - last_chunk_start)[1:].unsqueeze(1)
+            target_step = step_change_mm(succ_target)
+            for k in range(int(chunk_phase.max()) + 1):
+                smooth_stats[f"target_step_mm_phase{k}"] = (
+                    target_step[(chunk_phase == k) & d1_valid].mean().item()
+                )
+            smooth_stats["target_jerk_mm"] = second_diff_mm(succ_target)[d2_valid].mean().item()
+            smooth_stats["base_target_jerk_mm"] = (
+                second_diff_mm(succ_base)[d2_valid].mean().item()
+            )
+            smooth_stats["residual_jerk_mm"] = (
+                second_diff_mm(succ_target - succ_base)[d2_valid].mean().item()
+            )
+            smooth_stats["ee_jerk_mm"] = second_diff_mm(succ_ee)[d2_valid].mean().item()
         else:
             success_timesteps_share = 0
             mean_success_episode_length = 0
@@ -486,7 +591,7 @@ def main(cfg: DictConfig):
             f"SR: {success_rate:.4%}, SPS: {steps_per_iteration * cfg.num_envs / (time.time() - iteration_start_time):.2f}"
             f", STS: {success_timesteps_share:.4%}, MSEL: {mean_success_episode_length:.2f}"
             f", TQ p99: {torque_ratio_p99:.3f}, turns: {success_part_turns:.2f}"
-            f", force fail: {force_fail_rate:.2%}"
+            f", force fail: {force_fail_rate:.2%}, twist fail: {twist_fail_rate:.2%}"
         )
         if peak_tq_stats:
             print(
@@ -499,6 +604,39 @@ def main(cfg: DictConfig):
                     f"{thr}: {peak_tq_stats[f'peak_torque_ratio_above_{thr}']:.1%}"
                     for thr in peak_tq_thresholds
                 )
+            )
+        if insert_stats:
+            print(
+                "Success insertion (within 3 cm): twist turns p10/p50/p90: "
+                + "/".join(
+                    f"{insert_stats[f'insert_twist_turns_p{q}']:.2f}" for q in (10, 50, 90)
+                )
+                + ", |twist| >= "
+                + ", ".join(
+                    f"{thr}: {insert_stats[f'insert_twist_abs_above_{thr}']:.1%}"
+                    for thr in twist_thresholds
+                )
+                + f", net from reset p50: {insert_stats['net_twist_turns_p50']:.2f}"
+                + f", steps: {insert_stats['insert_steps']:.0f}"
+            )
+            print(
+                "Success target below EE in insertion, peak mm p50/p90/p99: "
+                + "/".join(
+                    f"{insert_stats[f'insert_down_offset_mm_p{q}']:.1f}" for q in (50, 90, 99)
+                )
+                + f", steps > 5 mm: {insert_stats['insert_steps_down_offset_above_5mm']:.1f}"
+                + f", |offset| p99 up to success: {insert_stats['offset_mm_p99']:.1f} mm"
+            )
+        if smooth_stats:
+            print(
+                "Success smoothness (mm/step): target step by chunk phase: "
+                + " ".join(
+                    f"{v:.2f}"
+                    for k, v in smooth_stats.items()
+                    if k.startswith("target_step_mm_phase")
+                )
+                + f", 2nd diff target/EE: {smooth_stats['target_jerk_mm']:.2f}/{smooth_stats['ee_jerk_mm']:.2f}"
+                + f", base/residual: {smooth_stats['base_target_jerk_mm']:.2f}/{smooth_stats['residual_jerk_mm']:.2f}"
             )
 
         if eval_mode:
@@ -537,7 +675,10 @@ def main(cfg: DictConfig):
                     "eval/torque_ratio_p99": torque_ratio_p99,
                     "eval/success_leg_rotation_turns": success_part_turns,
                     **{f"eval/{k}": v for k, v in peak_tq_stats.items()},
+                    **{f"eval/{k}": v for k, v in insert_stats.items()},
+                    **{f"eval/{k}": v for k, v in smooth_stats.items()},
                     "eval/force_fail_rate": force_fail_rate,
+                    "eval/twist_fail_rate": twist_fail_rate,
                     "iteration": iteration,
                 },
                 step=global_step,
@@ -701,7 +842,10 @@ def main(cfg: DictConfig):
                 "charts/torque_ratio_p99": torque_ratio_p99,
                 "charts/success_leg_rotation_turns": success_part_turns,
                 **{f"charts/{k}": v for k, v in peak_tq_stats.items()},
+                **{f"charts/{k}": v for k, v in insert_stats.items()},
+                **{f"charts/{k}": v for k, v in smooth_stats.items()},
                 "charts/force_fail_rate": force_fail_rate,
+                "charts/twist_fail_rate": twist_fail_rate,
                 "charts/action_norm_mean": action_norms.mean(),
                 "charts/action_norm_std": action_norms.std(),
                 "values/advantages": b_advantages.mean().item(),
