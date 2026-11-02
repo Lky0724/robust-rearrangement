@@ -18,6 +18,8 @@ The problems found when reproducing ResiP Stage 2 (residual PPO) with our own BC
 | M3 | Eval and training | Base, R1, R3 | Twist, target offset, smoothness | Twist separates screwing (1.19 turns) from forcing (0.26) completely |
 | R6 | `-tw075` (`ajuv8htb`) | R1 best | Stricter success check: twist ≥ 0.75 turns | Eval SR 38.9% → ~64% (best 65.8%). **No hacking**: twist −1.19 turns throughout. Force and jitter grow slowly over training. |
 | M4 | Offline, saved rollouts | Base, R1, R2, R3 | Smoothness of `evaluate_model` rollouts | Clean EE 1.8× less smooth than base in position. Target rows were wrong at first (the saved delta was used as the target); corrected 2026-10-31 |
+| R7 | `-tw075-sm1` (`pz60k6mc`) | R1 best | 1a + smoothness loss on the policy mean (3g, weight 1.0) | Smoother than the base policy itself, and force about halved, but eval SR fell from 37.6% to ~29% (R6 at the same point: ~61%). Weight too strong. Crashed at iteration 388. |
+| R8 | `-tw075-sm01` | R1 best | Same as R7, weight 0.1 | Next |
 
 ---
 
@@ -27,7 +29,7 @@ The problems found when reproducing ResiP Stage 2 (residual PPO) with our own BC
 |---|---|---|
 | P1 | **Reward hacking**: the policy forces the leg straight down past the threads instead of screwing it in (~1.2 turns of twist during insertion) | The success check looks only at the final pose, not at how it was reached. It requires the leg's orientation to be within ~20° of the assembled one (`ori_bound` 0.94), so the twist can only be about 0.26 + k turns; forcing is k = 0 and skips one full turn of the thread. With γ = 0.999, finishing sooner pays more: forcing succeeds in ~333 steps, screwing in ~789, so a forced success is worth 0.999^333 ≈ 0.72 vs 0.999^789 ≈ 0.45 (1.58×). The simulated threads are shallow (~0.6 mm deep, SDF resolution 512) and can be pushed past. |
 | P2 | **Force may not be executable on the real robot** | Sim joint stiffness is 1000, while the real robot's polymetis `Kq` is 40–160. The residual output is unbounded (no tanh or clamp), and the action is an absolute pose target, so the target can be placed far below the part and the force has no cap. Forcing places the target ~76 mm below the end effector, vs ~22 mm when screwing (M3). Without forcing, the offset still creeps up over training (R6: 22 → 26 mm p50). |
-| P3 | **Jerky motion**: successful PPO rollouts move in stops and starts, even on simple free-space segments, unlike the base policy. Seen in videos made with `src/eval/evaluate_model.py --save-rollouts` and `scripts/visualize_data.py video`. | Confirmed in M4 and R6, mainly in position, and it grows over training. **The PPO targets zigzag**: the lag-1 autocorrelation of the target's per-step motion is +0.61 for the base (consecutive steps keep their direction), +0.18 for clean, −0.21 for R6 and about −0.3 for the hacking runs (the next step tends to reverse). R6's end effector is 3× less smooth than the base's. Each base chunk starts with a surge, which the residual amplifies, but every other step also moves 2–3× the base's, and in R6's training the ordinary steps grew much more than the chunk-start step (+66% vs +13%). The base's part stays constant; the residual's part grows (R6 eval: 2.8 → 8.6 mm). Likely causes: nothing in the objective rewards smoothness (sparse success reward, and the stiff PD drive hides target jitter, so it costs no successes); the residual learns strong feedback to recover from the 7–8 mm/step exploration noise, which overshoots without noise; γ = 0.999 rewards speed; nothing makes the residual's mean vary smoothly between neighboring states. Rare one-step 180° flips of a part's orientation in the observation add single jolts. Base videos were made the same way, so the 3× playback speed of `visualize_data.py video` (30 fps for 10 Hz data) doesn't explain the difference. |
+| P3 | **Jerky motion**: successful PPO rollouts move in stops and starts, even on simple free-space segments, unlike the base policy. Seen in videos made with `src/eval/evaluate_model.py --save-rollouts` and `scripts/visualize_data.py video`. | Confirmed in M4 and R6, mainly in position, and it grows over training. **The PPO targets zigzag**: the lag-1 autocorrelation of the target's per-step motion is +0.61 for the base (consecutive steps keep their direction), +0.18 for clean, −0.21 for R6 and about −0.3 for the hacking runs (the next step tends to reverse). R6's end effector is 3× less smooth than the base's. Each base chunk starts with a surge, which the residual amplifies, but every other step also moves 2–3× the base's, and in R6's training the ordinary steps grew much more than the chunk-start step (+66% vs +13%). The base's part stays constant; the residual's part grows (R6 eval: 2.8 → 8.6 mm). Likely causes: nothing in the objective rewards smoothness (sparse success reward, and the stiff PD drive hides target jitter, so it costs no successes); the residual learns strong feedback to recover from the 7–8 mm/step exploration noise, which overshoots without noise; γ = 0.999 rewards speed; nothing makes the residual's mean vary smoothly between neighboring states. Rare one-step 180° flips of a part's orientation in the observation add single jolts. Base videos were made the same way, so the 3× playback speed of `visualize_data.py video` (30 fps for 10 Hz data) doesn't explain the difference. In R7, a smoothness loss at weight 1.0 removed the zigzag but cost too much SR; a lower weight is next. |
 | P4 | **Remaining failures**: eval SR plateaus at ~64% (R6) | All saved R6 failures happen while grasping or setting the leg into the hole; every episode that set the leg in finished screwing it. The base fails at the same two stages (16 of its 17 saved failures). |
 
 ---
@@ -71,9 +73,10 @@ The problems found when reproducing ResiP Stage 2 (residual PPO) with our own BC
 | Option | What | Assessment |
 |---|---|---|
 | ~~3f. Measure `evaluate_model` rollouts~~ | — | Done (M4, corrected in R6): the jitter is real, mainly in position, and is mostly step-to-step back-and-forth, plus a surge at each chunk start. |
-| **3g. Smoothness loss on the policy mean** | Add to the actor loss the squared second difference of the final target (base + residual mean) over consecutive steps of the rollout | **Recommended first.** Targets the measured cause (the residual's zigzag) directly. Uses the mean, so exploration noise doesn't enter (unlike 3e); the second difference leaves constant-velocity motion alone; including the base lets the residual also soften the chunk-start surge. No reward change, no added lag, one coefficient. |
+| **3g. Smoothness loss on the policy mean** | Add to the actor loss the squared second difference of the final target (base + residual mean) over consecutive steps of the rollout | **Implemented as `residual_smooth`. It works, but weight 1.0 is too strong** (R7): the motion became smoother than the base's and eval SR fell to ~29%. Weight 0.1 is next (R8). Targets the measured cause (the residual's zigzag) directly. Uses the mean, so exploration noise doesn't enter (unlike 3e); the second difference leaves constant-velocity motion alone; including the base lets the residual also soften the chunk-start surge. No reward change, no added lag, one coefficient. |
 | 3a. Smooth the residual | Exponential smoothing, or a cap on the per-step change of the residual | If 3g isn't enough. Guaranteed smoothness, but adds lag, which can hurt the precise insertion; best with the previous residual added to the observation. |
-| 3h. Less, or temporally correlated, exploration noise | Lower `init_logstd`, or noise correlated over steps | Weakens the pressure to learn strong feedback against white noise. A second-round experiment. |
+| 3h. Less, or temporally correlated, exploration noise | Lower `init_logstd`, or noise correlated over steps | Weakens the pressure to learn strong feedback against white noise. A second-round experiment. R7's 21-point gap between training and eval SR adds a reason: with less noise, PPO has to learn the alignment in the mean, which is what gets deployed. Unproven. |
+| 3j. Apply the smoothness loss only away from the precise phases | Skip the triplets where the leg is near the hole (and possibly around the grasp), so the policy keeps its fast corrections there | If no single weight gives both smoothness and SR. Needs a state-based mask; a loss change, not a reward change. |
 | 3c. Blend at replanning | Blend the old and new chunk where they meet, or execute fewer steps per chunk (e.g. 4 of 8) | Lower priority than first thought: it only addresses the chunk-start surge, not the zigzag at every step. Changes the base's behavior, so check the base's SR first. |
 | 3i. Find the orientation flips in the observation | A part's quaternion in `parts_poses` jumps 180° for one step (R6 results) | Rare, but each gives a single jolt (~21 mm target step in R6). Find the source first (read-only); low priority. |
 | 3b. `residual_l2` > 0 | Keeps the residual small, so the motion stays close to the smooth base | No code change; weakens the correction. |
@@ -84,8 +87,8 @@ The problems found when reproducing ResiP Stage 2 (residual PPO) with our own BC
 
 | Option | What | Assessment |
 |---|---|---|
-| 4a. Check again after 3g | Grasping and setting the leg in are precise positioning, where a zigzagging target may hurt | No extra change; compare failure stages after R7. Unproven link. |
-| 4b. Train longer with a fresh LR schedule | R6's cosine LR was below ~15% of its peak in the last quarter | Comes with R7, which continues from R6 with a fresh schedule. |
+| 4a. Check again after 3g | Grasping and setting the leg in are precise positioning, where a zigzagging target may hurt | R7 shows no improvement: much smoother motion came with lower SR, and the saved failures are at the same stages (20 episodes only). Compare again after R8. |
+| 4b. Train longer with a fresh LR schedule | R6's cosine LR was below ~15% of its peak in the last quarter | Not tried: R7 started from R1, not R6. Try it on the final recipe. |
 | 4c. Log failure stages in training | Missed grasp / not lifted / not set into the hole / not finished, over all 2048 envs | Gives reliable shares; the saved rollouts have 2–4 per class. Needs code (the wrapper already has the part and gripper states). |
 | 4d. More BC demos of grasping and alignment | The base fails at the same stages | If RL stops improving them. |
 
@@ -98,12 +101,16 @@ Principles: get the success check right (1a), regularize the policy rather than 
 | Step | Content | Status |
 |---|---|---|
 | ~~R6~~ | Retrain from R1 with 1a only | Done: no hacking (§5) |
-| **R7** | 3g (smoothness loss), continuing from R6 best with 1a on. Check eval SR, the success-only smoothness metrics, the offline zigzag measure on saved rollouts, and the failure stages | Next; code to write |
-| Smoothness, round 2 | 3a or 3h if R7 isn't smooth enough | Conditional |
-| Physical limits | 2b (offset cap ~50 mm), then 2a (stiffness), one at a time | After smoothness |
-| Remaining failures | 4c (failure-stage logging) any time; 4a after R7; 4d if RL stalls | |
+| ~~R7~~ | 3g (smoothness loss) at weight 1.0 with 1a, from R1 best | Done: smoother than the base and half the force, but eval SR ~29% (§5) |
+| SR check | Evaluate R7's checkpoint 375 and R1 best with `evaluate_model` on 1024 episodes: 20 saved episodes show more successes than the training eval | **Next**; minutes, no training (§5, R8) |
+| Wandb storage | Upload only the best-SR checkpoint and keep the others local; delete the 13 numbered R6 and R7 checkpoints from wandb (all have local copies; 3.46 of 5.87 GB) | Before R8; not started, needs approval |
+| **R8** | Same as R7 with `residual_smooth=0.1`, so it differs only in the weight. Aim: SR close to R6's with EE jitter below its starting level | After the two above; command in §5 |
+| R9 | From scratch (no residual weights) with 1a and 3g at the weight R8 settles on: the from-scratch recipe | After R8. If the start is slow, try 3h next |
+| Smoothness, round 2 | 3j (loss only away from the precise phases) or 3h, if no single weight gives both smoothness and SR | Conditional |
+| Physical limits | 2b (offset cap ~50 mm), then 2a (stiffness), one at a time. R7's offset and torque fell with the jitter, so check how much is still needed | After smoothness |
+| Remaining failures | 4c (failure-stage logging) any time; 4a after R8; 4d if RL stalls | |
 | Observation flips | 3i: find the source | Any time, read-only |
-| End-to-end pipeline | Roll out a smooth, non-hacking checkpoint, filter by insertion twist (1b), smooth the actions if needed (3d), save D_synth, distill | After R7; needs an `evaluate_model.py` change |
+| End-to-end pipeline | Roll out a smooth, non-hacking checkpoint, filter by insertion twist (1b), smooth the actions if needed (3d), save D_synth, distill | After R8; needs an `evaluate_model.py` change |
 
 Notes:
 
@@ -302,7 +309,7 @@ The code up to here was committed as **`a8a2a49`**.
 
 ### M3 · Twist, target offset, smoothness · 2026-10-30
 
-**Code since R5** (uncommitted).
+**Code since R5.**
 
 - `env_rl_wrapper.py`: per-step `info["part_twist"]`, the signed rotation (rad) of the inserted part about its long axis (leg mesh local y) since the previous step, relative to the base part (swing-twist decomposition of the relative quaternion). `info["part_rel_pos"]`, its position in the base part's frame. `info["ee_goal_offset"]`, the position target (clipped to the env's action bounds) minus the end-effector position read before the step. No furniture-bench change.
 - `residual_ppo.py`: records whether the base started a new action chunk, the position target and the base's part of it. Prints and logs three new lines (training guide §3): insertion twist, target offset, and smoothness.
@@ -335,7 +342,7 @@ Commands: the three commands of M1.
 
 ### R6 · `-tw075` · 2026-10-30 · `ajuv8htb`
 
-**Code since M3** (uncommitted).
+**Code since M3.**
 
 - `env_rl_wrapper.py`: optional stricter success check (`safety.min_insert_twist_turns`, off by default). The wrapper sums `part_twist` while the leg is within 3 cm of any of the env's `assembled_rel_poses` positions, which are the same poses the success check uses. On the step the env reports the leg as newly assembled, it fails the env if the summed \|twist\| is below the threshold: no success reward, and the env is already done. It raises an error if enabled on an env without part and EE states.
 - `residual_ppo.py`: prints `twist fail` on the `SR:` line and logs `{charts,eval}/twist_fail_rate`. Twist failures count as failures in SR, STS, MSEL and the best-checkpoint choice.
@@ -491,4 +498,170 @@ Target step (mm) by step index mod 8 (0 = the first step of a new base chunk; co
 - Each base chunk starts with a surge (base 3.4 mm vs ~2.4 mm on other steps), and the residual, which takes the base action as input, amplifies it (clean 6.8 vs ~3.3 mm). But the clean target also moves ~1.4× the base's at every other phase.
 - M3's smoothness rows had hidden this, because they averaged over all running envs: failed episodes (88% of the base's) jitter in place. Caveat: only 3 successful base episodes.
 
-**Code since M3** (uncommitted; not used by R6, which was already running). `residual_ppo.py`: the smoothness metrics now cover successful episodes up to the success step, and the target step is logged per chunk phase (`{charts,eval}/target_step_mm_phase{0..7}`) instead of chunk start vs other. Printed as `Success smoothness (mm/step) …`. Logging only. Tested on synthetic rollouts: a 3 mm jump at each chunk start shows up in phase 0 only, and a failed env's jitter is left out.
+**Code since M3** (not used by R6, which was already running). `residual_ppo.py`: the smoothness metrics now cover successful episodes up to the success step, and the target step is logged per chunk phase (`{charts,eval}/target_step_mm_phase{0..7}`) instead of chunk start vs other. Printed as `Success smoothness (mm/step) …`. Logging only. Tested on synthetic rollouts: a 3 mm jump at each chunk start shows up in phase 0 only, and a failed env's jitter is left out.
+
+The code up to here was committed as **`87e5eb5`**.
+
+### R7 · `-tw075-sm1` · 2026-10-31 · `pz60k6mc`
+
+**Code since M4** (option 3g).
+
+- `residual_ppo.py`: optional smoothness loss on the policy mean, `residual_smooth` (off by default).
+  - Each iteration, it finds the rollout steps whose previous and next steps belong to the same episode (from `dones`).
+  - Each minibatch samples 1/16 of a minibatch of them (64k triplets at the current settings) and recomputes the residual mean at the three steps. It adds the base action, which ends the residual policy's observation.
+  - The loss is the mean squared second difference over position and rotation (9 of the 10 action dims; not the gripper), in residual units (normalized action / `action_scale`). It's weighted by `residual_smooth`, added to the actor loss, and logged as `losses/residual_smooth`.
+  - Estimated cost: +1–3% per iteration. The update is ~7% of an iteration (R6: ~15 of ~218 s), and this adds an actor-only pass over ~19% as many samples as the main loss.
+- `residual_ppo.py`: the all-env smoothness metrics logged up to R6 are back as `{charts,eval}/{target,ee,base_target,residual}_jerk_mm_allenv`, printed as `All-env smoothness (mm, as up to R6) …`, so R7's curves can be overlaid on R6's. Logging only.
+- Tested with fake rollouts (ad-hoc script):
+  - every sampled triplet is one env's consecutive steps, with no reset in between, and the gripper dim is dropped;
+  - minimizing the loss alone makes a deliberately high-gain toy policy stop reacting to a noisy input (loss 0.47 → 0.0004);
+  - a base that jumps every 8 steps is penalized even with a zero residual;
+  - with the weight at 0, the loss is 0;
+  - the stats block gives the same values as in M4's test, and also runs when no env succeeds.
+
+**Why from R1, not from R6.** The same start and command as R6 except `residual_smooth`, so the difference can be attributed to 3g. It also tests preventing the jitter rather than removing it, which is what training from scratch needs. R6's jitter grew from the start (residual part 2.8 → 4.3 mm by iterations 150–199), so 150–200 iterations should show whether 3g works.
+
+**Weight 1.0.** A rough, order-of-magnitude estimate: at R6's level of jitter, the smoothness loss's gradient on the residual mean is of the same order as the policy gradient's. It shrinks as the motion gets smoother.
+
+```bash
+python -m src.train.residual_ppo base_policy.wt_path=$BASE \
+  actor.residual_policy.pretrained_wts=models/ol-med-own-51-resip-2048/actor_chkpt_best_success_rate.pt \
+  actor.residual_policy.pretrained_load_optim=false \
+  env.task=one_leg env.randomness=med num_env_steps=1000 num_envs=2048 num_minibatches=2 \
+  total_timesteps=1000000000 checkpoint_interval=25 \
+  safety.min_insert_twist_turns=0.75 residual_smooth=1.0 wandb.name=ol-med-own-51-resip-2048-tw075-sm1
+```
+
+**Expected at iteration 1** (eval, before any update): the same as R6's iteration 1, eval SR ~39% and all-env EE second difference ~1.9 mm, since the policy hasn't changed yet.
+
+**Watch**, against R6 at the same iterations in wandb. R6 logged the all-env metrics without the `_allenv` suffix (its `eval/ee_jerk_mm` is R7's `eval/ee_jerk_mm_allenv`; R7's `eval/ee_jerk_mm` is success-only), so overlay R6's `eval/ee_jerk_mm` with R7's `eval/ee_jerk_mm_allenv`, and likewise for the residual:
+
+| Metric (R7 / R6 key) | R6 at iterations 0–49 → 150–199 | Good sign for R7 |
+|---|---|---|
+| `eval/success_rate` | 38.3% → 50.0% | Close to R6; a few points lower is an acceptable price |
+| `eval/ee_jerk_mm_allenv` / `eval/ee_jerk_mm` | 1.89 → 2.11 | Flat or falling |
+| `eval/residual_jerk_mm_allenv` / `eval/residual_jerk_mm` | 2.78 → 4.30 | Flat or falling |
+| `losses/residual_smooth` | — | Falling |
+| Insertion twist, `twist fail` | −1.19 turns, ~0% | Unchanged |
+
+Also note the success-only metrics (`eval/ee_jerk_mm`, `eval/target_step_mm_phase*`) as reference values for later runs, and `losses/approx_kl`: the extra loss also moves the mean, so early stops may come sooner.
+
+**Adjust:**
+- If eval SR stays more than ~5 points below R6's at the same iterations after ~50 iterations (average several evals; one eval varies by ±1 point), stop and retry with `residual_smooth=0.5`.
+- If the jitter grows like R6's after ~100 iterations, stop and retry with `residual_smooth=2.0`.
+- Otherwise, let it run to the end; it would become the best checkpoint so far.
+- Afterwards, save rollouts with the R6 rollout command (R7 checkpoint, a new `--save-rollouts-suffix`) for the offline zigzag measure and the failure stages.
+
+**Results.** Crashed at iteration 388 of 488 after ~22 h (2026-11-01 21:12, wandb state `crashed`). The log stops mid-rollout with no traceback, and the machine didn't reboot; the cause wasn't found. Iteration 1 matched the expectation: eval SR 37.6%, all-env EE second difference 1.90 mm. **3g removes the jitter, but weight 1.0 costs too much SR.** Eval SR never beat iteration 1, so `actor_chkpt_best_success_rate.pt` holds R1's weights; `actor_chkpt_375.pt` is the one that shows R7's behavior.
+
+| Iterations | 0–49 | 50–99 | 150–199 | 300–349 | 350–386⁴ |
+|---|---|---|---|---|---|
+| R7 eval SR | 35.3% | 27.3% | 30.1% | 29.3% | 29.1% |
+| R6 eval SR | 38.3% | 42.2% | 50.0% | 58.1% | 60.8% |
+| R7 training SR | 33.3% | 29.9% | 41.2% | 49.8% | 50.4% |
+| R6 training SR | 35.2% | 40.2% | 48.9% | 59.9% | 62.1% |
+| R7 eval MSEL | 789 | 811 | 749 | 686 | 665 |
+| R6 eval MSEL | 781 | 773 | 754 | 716 | 708 |
+
+⁴ R6's column is 350–399.
+
+The first adjust rule above was met by iterations 50–99 (27.3% vs 42.2%). The run kept going, and SR didn't recover.
+
+Eval metrics; the second differences are over all running envs:
+
+| | R7, iteration 1 | R7, 350–386 | R6, 350–399 |
+|---|---|---|---|
+| Target second difference (mm) | 6.61 | 1.17 | 9.44 |
+| EE second difference (mm) | 1.90 | 0.37 | 2.38 |
+| Base part / residual part (mm) | 5.15 / 2.62 | 6.85 / 6.63 | 5.05 / 6.18 |
+| Peak target below EE in insertion, p50 / p99 (mm) | 22.1 / 37.8 | 15.1 / 22.9 | 24.4 / 41.6 |
+| Peak torque ratio p50 / p99, successful episodes | 0.11 / 0.63 | 0.07 / 0.47 | 0.13 / 1.12 |
+| Insertion steps | 466 | 386 | 428 |
+| Insertion twist p50 (turns) | −1.19 | −1.19 | −1.19 |
+
+- **The jitter fell far past the goal.** EE second difference fell 5× while R6's rose 1.3×. The loss includes the base, so the residual learned to cancel the base's jitter: the base and residual parts are each ~6.8 mm, and their sum is 1.2 mm.
+- **Force fell too.** Offset and peak torque are roughly half of R6's at the same iterations. Twist stays at −1.19 turns, eval `twist fail` at 0.00%, and it inserts faster than R6, so this isn't forcing.
+- **The mean no longer performs like the noisy policy.** Training SR reached 50.4% while eval stayed at 29.1%, a 21-point gap (R6: ~1 point at those iterations). PPO keeps improving the noisy policy, and the loss constrains only the mean. Likely, though not shown, the mean now makes too few of the small corrections alignment needs, and the noise supplies some of them.
+- `losses/residual_smooth` fell from 0.063 (iterations 6–49) to 0.015 (150–199) and 0.010 (300–388), so the estimate behind weight 1.0 was too high. `losses/approx_kl` stayed far below `target_kl` (bucket means ≤ 0.02 vs 0.1).
+
+**Saved rollouts** (`evaluate_model`, 20 episodes per checkpoint, in `…-tw075-sm1_eval_vid/actor_chkpt_375` and `…/actor_chkpt_best_success_rate`). Smoothness of successful episodes, measured as in R6:
+
+| | Base | R1 (clean) | R6 | R7, checkpoint 375 |
+|---|---|---|---|---|
+| Successful episodes | 3 | 18 | 13 | 11 |
+| Mean length (steps) | 889 | 806 | 702 | 694 |
+| Target step / EE step (mm) | 2.51 / 1.95 | 3.92 / 2.50 | 6.13 / 3.32 | 2.87 / 2.58 |
+| Target second difference (mm) | 2.05 | 4.52 | 8.57 | 1.50 |
+| **EE second difference (mm)** | 0.73 | 1.30 | 2.16 | **0.64** |
+| **Lag-1 autocorrelation of the target's per-step motion** | +0.61 | +0.18 | −0.21 | **+0.81** |
+| Same, of the EE's | 0.91 | 0.84 | 0.72 | 0.95 |
+| Target second difference before the grasp (free-space reach, mm) | 3.45 | 6.75 | 10.11 | 1.51 |
+| Mean target-to-EE offset (mm) | 5.5 | 7.7 | 9.8 | 7.6 |
+| Target / EE rotation second difference (°) | 1.36 / 0.52 | 1.61 / 0.58 | 2.15 / 0.73 | 0.38 / 0.17 |
+| Target step, chunk start / mid-chunk (phase 4) (mm) | 3.43 / 2.40 | 6.82 / 3.31 | 11.20 / 5.19 | 3.95 / 2.72 |
+
+Checkpoint 375 beats even the base in every second-difference and autocorrelation row, and the zigzag is gone. The videos agree: the motion is visibly smoother than in earlier runs, but SR is lower and it sometimes can't insert precisely.
+
+Failure stages, all saved episodes:
+
+| | R1 (30) | R1's weights, new sample (20)⁵ | R6 (20) | R7, checkpoint 375 (20) |
+|---|---|---|---|---|
+| Success | 60% | 45% | 65% | 55% |
+| Missed grasp (gripper closed on nothing) | 23% | 15% | 10% | 15% |
+| Closed on the leg, not lifted | 0 | 10% | 10% | 15% |
+| Lifted, never set into the hole | 17% | 25% | 15% | 15% |
+| Set into the hole, not finished | 0 | 5% | 0 | 0 |
+
+⁵ R7's `actor_chkpt_best_success_rate.pt`.
+
+Of checkpoint 375's 9 failures, 3 came within 25–32 mm of the assembled position and never set the leg in, which is the imprecise insertion in the videos (R6's were at 25–28 mm). One of those 3 is counted as a missed grasp above: its gripper reads closed for most of the episode, but the leg was lifted 231 mm. Another 5 never lifted the leg, and 1 lifted it but stayed far from the hole. There are too few episodes to compare shares between policies.
+
+**Saved-rollout SR disagrees with the training eval (unresolved).** Checkpoint 375 succeeded in 11 of 20 episodes (95% interval 34–74%), against 29.2% at iteration 376, the first eval with those weights. R1's weights lean the same way: 27 of 50 across both samples (40–67%), against ~38%. R6 agrees (13 of 20, ~64%). Both evals use the policy mean and 4 DDIM steps, so neither explains it. What remains is the small sample, the env count (20 vs 2048), image vs state observations, and the wrappers. The run comparisons here all use the 2048-env training eval.
+
+**Conclusion.** 3g is the right tool at the wrong weight. R7 also shows that smoothness and lower force can come together, with no sign of hacking. Next: settle the SR disagreement, then retry at a much lower weight (R8).
+
+### R8 · `-tw075-sm01` · planned
+
+**Check first** (a few minutes each, no training):
+
+```bash
+python -m src.eval.evaluate_model --wt-path models/ol-med-own-51-resip-2048-tw075-sm1/actor_chkpt_375.pt \
+  -f one_leg --randomness med --n-envs 1024 --n-rollouts 1024 --max-rollout-steps 1000 \
+  --action-type pos --observation-space state
+python -m src.eval.evaluate_model --wt-path models/ol-med-own-51-resip-2048/actor_chkpt_best_success_rate.pt \
+  -f one_leg --randomness med --n-envs 1024 --n-rollouts 1024 --max-rollout-steps 1000 \
+  --action-type pos --observation-space state
+```
+
+Each prints `Success rate: …`. If they read about 29% and 38%, the training eval holds, and the higher saved-rollout SR comes from the small sample or from running 20 envs with images. If they read much higher, `evaluate_model` and the training eval aren't comparable: find out why before judging R8 by SR.
+
+**Also first:** wandb storage is full, and this command would upload a numbered checkpoint every 25 iterations. Apply the upload change in §4 before starting.
+
+**Weight 0.1.** R7's EE jitter ended 5× below its start and below the base's, and SR had already dropped within 100 iterations, so there's room to ease off. R7's adjust rule said 0.5, but the overshoot is large enough that a 10× step tells us more. This is a judgment call, not a computed value.
+
+```bash
+python -m src.train.residual_ppo base_policy.wt_path=$BASE \
+  actor.residual_policy.pretrained_wts=models/ol-med-own-51-resip-2048/actor_chkpt_best_success_rate.pt \
+  actor.residual_policy.pretrained_load_optim=false \
+  env.task=one_leg env.randomness=med num_env_steps=1000 num_envs=2048 num_minibatches=2 \
+  total_timesteps=1000000000 checkpoint_interval=25 \
+  safety.min_insert_twist_turns=0.75 residual_smooth=0.1 wandb.name=ol-med-own-51-resip-2048-tw075-sm01
+```
+
+**Expected at iteration 1:** the same as R6 and R7, eval SR ~38% and all-env EE second difference ~1.9 mm.
+
+**Watch** (R6's keys have no `_allenv` suffix; see R7):
+
+| Metric | R6, iterations 150–199 / 350–399 | R7, 150–199 / 350–386 | Good sign for R8 |
+|---|---|---|---|
+| Eval SR | 50.0% / 60.8% | 30.1% / 29.1% | Within ~5 points of R6 |
+| All-env EE second difference (mm) | 2.11 / 2.38 | 0.57 / 0.37 | Below its ~1.9 start and not rising |
+| All-env target second difference (mm) | 7.92 / 9.44 | 1.86 / 1.17 | Below its ~6.6 start and not rising |
+| Training SR − eval SR (points) | −1.1 / +1.2 | +11.1 / +21.3 | Near 0 |
+
+**Adjust:**
+- If eval SR stays more than ~5 points below R6's over iterations 50–99 (R6: 42.2%), stop and retry with `residual_smooth=0.03`. R7's drop was clear by then (~6 h).
+- If all-env EE jitter rises like R6's by iterations 150–199 (2.1 mm), stop and retry with `residual_smooth=0.3`.
+- Otherwise, let it run to the end. Afterwards, save rollouts from the best checkpoint and compare them with the tables in R7. Aim for EE second difference at or below R1's 1.30 mm, positive target autocorrelation, and no more near-hole failures than R6.
+
+**Results.** Not started.

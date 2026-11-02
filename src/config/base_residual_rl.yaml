@@ -55,6 +55,10 @@ lr_scheduler:
 # Residual specific arguments
 residual_l1: 0.0
 residual_l2: 0.0
+# Smoothness loss on the policy mean: mean squared second difference over three consecutive
+# steps of the target (base action + residual mean; position and rotation, not the gripper),
+# in residual units (normalized action / action_scale). 0 disables it (paper setting).
+residual_smooth: 0.0
 
 # Algorithm specific arguments
 discount: 0.999

@@ -463,8 +463,28 @@ def main(cfg: DictConfig):
         twist_thresholds = (1.0, 1.5)
         insert_stats = {}
 
-        # Smoothness of successful episodes up to the success step
-        smooth_stats = {}
+        def second_diff_mm(x):
+            return (x[2:] - 2 * x[1:-1] + x[:-2]).norm(dim=-1) * 1000
+
+        # Smoothness over the steps where the env is still running, including failed
+        # episodes (second differences in mm, as logged up to R6, for comparing with those
+        # runs). The success-only metrics below are the ones to judge a policy by.
+        running = dones == 0
+        d2_running = running[2:] & running[1:-1] & running[:-2]
+        smooth_stats = {
+            "target_jerk_mm_allenv": second_diff_mm(target_pos)[d2_running].mean().item(),
+            "base_target_jerk_mm_allenv": second_diff_mm(base_target_pos)[d2_running]
+            .mean()
+            .item(),
+            "residual_jerk_mm_allenv": second_diff_mm(target_pos - base_target_pos)[
+                d2_running
+            ]
+            .mean()
+            .item(),
+            "ee_jerk_mm_allenv": second_diff_mm(target_pos - ee_goal_offsets)[d2_running]
+            .mean()
+            .item(),
+        }
 
         if success_rate > 0:
             # Calculate the share of timesteps that come from successful trajectories that account for the success rate and the varying number of timesteps per trajectory
@@ -555,9 +575,6 @@ def main(cfg: DictConfig):
             def step_change_mm(x):
                 return (x[1:] - x[:-1]).norm(dim=-1) * 1000
 
-            def second_diff_mm(x):
-                return (x[2:] - 2 * x[1:-1] + x[:-2]).norm(dim=-1) * 1000
-
             succ_target = target_pos[:, env_success]
             succ_base = base_target_pos[:, env_success]
             succ_ee = succ_target - offsets
@@ -627,7 +644,13 @@ def main(cfg: DictConfig):
                 + f", steps > 5 mm: {insert_stats['insert_steps_down_offset_above_5mm']:.1f}"
                 + f", |offset| p99 up to success: {insert_stats['offset_mm_p99']:.1f} mm"
             )
-        if smooth_stats:
+        print(
+            "All-env smoothness (mm, as up to R6): 2nd diff target/EE: "
+            + f"{smooth_stats['target_jerk_mm_allenv']:.2f}/{smooth_stats['ee_jerk_mm_allenv']:.2f}"
+            + f", base/residual: {smooth_stats['base_target_jerk_mm_allenv']:.2f}"
+            + f"/{smooth_stats['residual_jerk_mm_allenv']:.2f}"
+        )
+        if "ee_jerk_mm" in smooth_stats:
             print(
                 "Success smoothness (mm/step): target step by chunk phase: "
                 + " ".join(
@@ -718,6 +741,12 @@ def main(cfg: DictConfig):
         # Optimizing the policy and value network
         b_inds = np.arange(cfg.batch_size)
         clipfracs = []
+
+        # For the smoothness loss: the middle steps of three consecutive steps within one
+        # episode, as indices into b_obs (step t of env n is t * num_envs + n)
+        if cfg.residual_smooth > 0:
+            same_episode = (dones[1:-1] == 0) & (dones[2:] == 0)
+            smooth_mid_inds = torch.nonzero(same_episode.flatten()).squeeze(1) + cfg.num_envs
         for epoch in trange(cfg.update_epochs, desc="Policy update"):
             early_stop = False
 
@@ -787,6 +816,28 @@ def main(cfg: DictConfig):
                 residual_l1_loss = torch.mean(torch.abs(action_mean))
                 residual_l2_loss = torch.mean(torch.square(action_mean))
 
+                # Smoothness loss: squared second difference of the target (base action +
+                # residual mean) over three consecutive steps, for position and rotation
+                # (not the gripper), in residual units (normalized action / action_scale).
+                # It uses the mean, so the exploration noise doesn't enter.
+                if cfg.residual_smooth > 0:
+                    mid = smooth_mid_inds[
+                        torch.randint(len(smooth_mid_inds), (cfg.minibatch_size // 16,))
+                    ]
+                    triplet_obs = b_obs[
+                        torch.cat([mid - cfg.num_envs, mid, mid + cfg.num_envs])
+                    ].to(device)
+                    n_act = b_actions.shape[-1]
+                    # The residual policy's observation ends with the normalized base action
+                    triplet_target = (
+                        triplet_obs[:, -n_act:] / residual_policy.action_scale
+                        + residual_policy.actor_mean(triplet_obs)
+                    )[:, :-1]
+                    prev, cur, nxt = triplet_target.chunk(3)
+                    residual_smooth_loss = torch.mean(torch.square(nxt - 2 * cur + prev))
+                else:
+                    residual_smooth_loss = torch.zeros((), device=device)
+
                 # Normalize the losses so that each term has the same scale
                 if iteration > cfg.n_iterations_train_only_value:
 
@@ -794,6 +845,7 @@ def main(cfg: DictConfig):
                     policy_loss += ppo_loss
                     policy_loss += cfg.residual_l1 * residual_l1_loss
                     policy_loss += cfg.residual_l2 * residual_l2_loss
+                    policy_loss += cfg.residual_smooth * residual_smooth_loss
 
                 # Total loss
                 loss: torch.Tensor = policy_loss + v_loss * cfg.vf_coef
@@ -862,6 +914,7 @@ def main(cfg: DictConfig):
                 "losses/explained_variance": explained_var,
                 "losses/residual_l1": residual_l1_loss.item(),
                 "losses/residual_l2": residual_l2_loss.item(),
+                "losses/residual_smooth": residual_smooth_loss.item(),
                 "histograms/values": wandb.Histogram(values),
                 "histograms/returns": wandb.Histogram(b_returns),
                 "histograms/advantages": wandb.Histogram(b_advantages),
