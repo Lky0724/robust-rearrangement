@@ -114,6 +114,13 @@ def main(cfg: DictConfig):
             run_path, "latest", wandb_mode=cfg.wandb.mode
         )
 
+        # Only the best-SR checkpoint is on wandb; prefer the newest checkpoint on this machine
+        local_wts = sorted(
+            Path("models", run.name).glob("actor_chkpt_*.pt"), key=os.path.getmtime
+        )
+        if local_wts:
+            wts = str(local_wts[-1])
+
         # Update the cfg.continue_run_id to the run_id
         cfg.wandb.continue_run_id = run_id
 
@@ -929,7 +936,7 @@ def main(cfg: DictConfig):
         lr_scheduler_actor.step()
         lr_scheduler_critic.step()
 
-        # Checkpoint every cfg.checkpoint_interval steps
+        # Checkpoint every cfg.checkpoint_interval steps (kept locally, not uploaded to wandb)
         if cfg.checkpoint_interval > 0 and iteration % cfg.checkpoint_interval == 0:
             model_path = str(model_save_dir / f"actor_chkpt_{iteration}.pt")
             torch.save(
@@ -947,7 +954,6 @@ def main(cfg: DictConfig):
                 model_path,
             )
 
-            wandb.save(model_path)
             print(f"Model saved to {model_path}")
 
         # Print some stats at the end of the iteration

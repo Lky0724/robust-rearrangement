@@ -130,15 +130,25 @@ def main(cfg: DictConfig):
 
         data_paths_override = cfg.data.data_paths_override
 
+        # Only the best-SR checkpoint is on wandb; prefer the last checkpoint on this machine
+        local_wts = sorted(
+            Path.cwd().parents[1].glob(f"*/*/models/{run.name}/actor_chkpt_last.pt"),
+            key=os.path.getmtime,
+        )
+
         # Load the weights from the run and override the config with the one from the run
-        try:
-            cfg, wts = get_model_from_api_or_cached(
-                run_path, "last", wandb_mode=wandb_mode
-            )
-        except:
-            cfg, wts = get_model_from_api_or_cached(
-                run_path, "latest", wandb_mode=wandb_mode
-            )
+        if local_wts:
+            cfg, _ = get_model_from_api_or_cached(run_path, None, wandb_mode=wandb_mode)
+            wts = str(local_wts[-1])
+        else:
+            try:
+                cfg, wts = get_model_from_api_or_cached(
+                    run_path, "last", wandb_mode=wandb_mode
+                )
+            except:
+                cfg, wts = get_model_from_api_or_cached(
+                    run_path, "latest", wandb_mode=wandb_mode
+                )
 
         # Ensure we set the `continue_run_id` to the run_id
         cfg.wandb.continue_run_id = run_id
@@ -564,6 +574,7 @@ def main(cfg: DictConfig):
                     epoch_idx=epoch_idx,
                 )
 
+            # Only the best success rate checkpoint is uploaded to wandb, the others stay local
             # Save the model if the test loss is the best so far
             if (
                 cfg.training.store_best_test_loss_model
@@ -572,7 +583,6 @@ def main(cfg: DictConfig):
                 best_test_loss = test_loss_mean
                 save_path = str(model_save_dir / f"actor_chkpt_best_test_loss.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
 
             # Save the model if the success rate is the best so far
             if (
@@ -590,7 +600,6 @@ def main(cfg: DictConfig):
             ):
                 save_path = str(model_save_dir / f"actor_chkpt_{epoch_idx}.pt")
                 torch.save(save_dict, save_path)
-                wandb.save(save_path)
 
             # Run diffusion sampling on a training batch
             if (
@@ -630,7 +639,6 @@ def main(cfg: DictConfig):
         if cfg.training.store_last_model:
             save_path = str(model_save_dir / f"actor_chkpt_last.pt")
             torch.save(save_dict, save_path)
-            wandb.save(save_path)
 
         # If switch is enabled, copy the the shadow to the model at the end of each epoch
         if cfg.training.ema.use and cfg.training.ema.switch:

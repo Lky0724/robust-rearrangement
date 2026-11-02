@@ -103,7 +103,7 @@ Principles: get the success check right (1a), regularize the policy rather than 
 | ~~R6~~ | Retrain from R1 with 1a only | Done: no hacking (§5) |
 | ~~R7~~ | 3g (smoothness loss) at weight 1.0 with 1a, from R1 best | Done: smoother than the base and half the force, but eval SR ~29% (§5) |
 | SR check | Evaluate R7's checkpoint 375 and R1 best with `evaluate_model` on 1024 episodes: 20 saved episodes show more successes than the training eval | **Next**; minutes, no training (§5, R8) |
-| Wandb storage | Upload only the best-SR checkpoint and keep the others local; delete the 13 numbered R6 and R7 checkpoints from wandb (all have local copies; 3.46 of 5.87 GB) | Before R8; not started, needs approval |
+| Wandb storage | ~~Upload only the best-SR checkpoint and keep the others local~~ (code done in `residual_ppo.py` and `bc.py`, §5). The 13 numbered R6 and R7 checkpoints already on wandb are kept (3.46 of 5.87 GB; all have local copies), so usage doesn't drop | Done; check R8's upload (§5) |
 | **R8** | Same as R7 with `residual_smooth=0.1`, so it differs only in the weight. Aim: SR close to R6's with EE jitter below its starting level | After the two above; command in §5 |
 | R9 | From scratch (no residual weights) with 1a and 3g at the weight R8 settles on: the from-scratch recipe | After R8. If the start is slow, try 3h next |
 | Smoothness, round 2 | 3j (loss only away from the precise phases) or 3h, if no single weight gives both smoothness and SR | Conditional |
@@ -620,7 +620,16 @@ Of checkpoint 375's 9 failures, 3 came within 25–32 mm of the assembled positi
 
 **Conclusion.** 3g is the right tool at the wrong weight. R7 also shows that smoothness and lower force can come together, with no sign of hacking. Next: settle the SR disagreement, then retry at a much lower weight (R8).
 
+The code up to here was committed as **`36e79a1`**.
+
 ### R8 · `-tw075-sm01` · planned
+
+**Code since R7** (wandb storage).
+
+- `residual_ppo.py` and `bc.py` upload only the best-SR checkpoint to wandb. Every other checkpoint is still written locally. The training scripts this project doesn't use (`ppo`, `vas`, `dagger`, `residual_ppo_w_bc`, `bc_ddp`) are unchanged, so they still upload everything they save.
+- `wandb.continue_run_id` prefers local files, since the others are no longer on wandb. `residual_ppo.py` loads the newest checkpoint in `models/<run>/`, and `bc.py` the newest `actor_chkpt_last.pt` under `outputs/*/*/models/<run>/`. Without them, both fall back to wandb ([BC guide](1_BC_TRAINING_GUIDE.md) §5, [training guide](2_RESIDUAL_PPO_TRAINING_GUIDE.md) §5.1).
+- Side effect: image BC has no best-SR file, so it uploads no checkpoint, and `src/real/minimal.py` reads weights only from wandb, so π_real needs a manual upload before deployment ([implementation guide](IMPLEMENTATION_GUIDE.md) §6, gotcha 9).
+- Found while checking this: all three BC runs logged repeated checkpoint upload errors (HTTP 400, `PROTOCOL_ERROR`), including for the best-SR file, which is probably why they have no `.pt` on wandb. The cause isn't known. So all 5.87 GB on wandb is from residual runs, and a BC checkpoint may not be on wandb even after this change.
 
 **Check first** (a few minutes each, no training):
 
@@ -635,7 +644,7 @@ python -m src.eval.evaluate_model --wt-path models/ol-med-own-51-resip-2048/acto
 
 Each prints `Success rate: …`. If they read about 29% and 38%, the training eval holds, and the higher saved-rollout SR comes from the small sample or from running 20 envs with images. If they read much higher, `evaluate_model` and the training eval aren't comparable: find out why before judging R8 by SR.
 
-**Also first:** wandb storage is full, and this command would upload a numbered checkpoint every 25 iterations. Apply the upload change in §4 before starting.
+**Wandb storage is still full** (§4). Numbered checkpoints no longer upload, but R8's best-SR file needs ~0.27 GB. After the first eval, check that it appears in the run's Files tab and that no numbered file does. The local copy is written whether or not the upload succeeds.
 
 **Weight 0.1.** R7's EE jitter ended 5× below its start and below the base's, and SR had already dropped within 100 iterations, so there's room to ease off. R7's adjust rule said 0.5, but the overshoot is large enough that a 10× step tells us more. This is a judgment call, not a computed value.
 

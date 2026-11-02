@@ -352,7 +352,9 @@ Also use `checkpoint_interval` (§5) during long runs, so you can go back to a c
 | `models/<run>/actor_chkpt_best_success_rate.pt` | After an eval iteration whose SR beats the best so far. Overwritten each time. | Full agent (base + residual), optimizers, LR schedulers, config, SR, STS, iteration. |
 | `models/<run>/actor_chkpt_<iteration>.pt` | Every `checkpoint_interval` iterations. Off by default (`-1`). | Same, minus STS. |
 
-Each checkpoint is **~266 MB** because it includes the frozen diffusion base policy. Don't set `checkpoint_interval=1` (~230 GB over a full run). `checkpoint_interval=25` gives ~28 snapshots (~7.5 GB), which is a reasonable safety net against a performance collapse between evals.
+Only `actor_chkpt_best_success_rate.pt` is uploaded to wandb; numbered checkpoints stay on disk.
+
+Each checkpoint is **~266 MB** because it includes the frozen diffusion base policy. Don't set `checkpoint_interval=1` (~230 GB over a full run). `checkpoint_interval=25` gives ~28 snapshots (~7.5 GB on disk), which is a reasonable safety net against a performance collapse between evals.
 
 A better policy between two evals isn't lost for learning: those weights keep training. Only the exact snapshot can be lost. PPO changes the policy in small steps (`clip_coef: 0.2`, `target_kl: 0.1`), so this rarely matters over a 4-iteration gap.
 
@@ -365,7 +367,7 @@ A better policy between two evals isn't lost for learning: those weights keep tr
 | Goal | How | Optimizer and LR schedule | Notes |
 |---|---|---|---|
 | **Continue from the best checkpoint with a fresh LR schedule** (e.g. the run was LR-limited, §2.6) | New run with `actor.residual_policy.pretrained_wts=<ckpt>` and `actor.residual_policy.pretrained_load_optim=false` | Fresh: warmup, then cosine over the new `total_timesteps` | Loads the weights only, including `actor_logstd`, so `init_logstd` has no effect. The first eval should match the checkpoint's SR. |
-| Pick up an interrupted run exactly where it stopped | `wandb.continue_run_id=<wandb run id>` | Restored, including the step count | Reloads the run's own config; command-line changes to the schedule are not applied. |
+| Pick up an interrupted run exactly where it stopped | `wandb.continue_run_id=<wandb run id>` | Restored, including the step count | Reloads the run's own config; command-line changes to the schedule are not applied. Loads the newest checkpoint in `models/<run>/` on this machine. Elsewhere it gets the best-SR file from wandb, so the weights, optimizer and LR schedule come from that iteration while the step count continues from where the run stopped. |
 | **Restart from scratch** (e.g. new noise setting, new base policy) | New run without `pretrained_wts` | Fresh | The residual starts at exactly zero (`action_head_std: 0`), so the first eval equals the base policy's SR. |
 
 ⚠️ With `pretrained_load_optim=true` (the default), `pretrained_wts` also restores the old optimizer and LR-scheduler state. The cosine schedule then resumes at the old run's step count but uses this run's `num_iterations`. If they differ, the LR reaches 0 early and then **rises again**: the diffusers cosine formula climbs back up once progress passes 1. For a warm start, set it to `false`.
@@ -452,7 +454,7 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 |---|---|---|
 | `base_policy.wt_path` | `null` | Local BC checkpoint (see 7.1). |
 | `base_policy.wandb_id` | `null` | Alternative to `wt_path`: `<project>/<run_id>` of a BC wandb run. It takes precedence over `wt_path` if both are set. |
-| `base_policy.wt_type` | `best_success_rate` | Which checkpoint file to fetch from the wandb run: `best_success_rate`, `best_test_loss` or `last`. Only used with `wandb_id`. |
+| `base_policy.wt_type` | `best_success_rate` | Which checkpoint file to fetch from the wandb run: `best_success_rate`, `best_test_loss` or `last`. Only used with `wandb_id`. Newly trained BC runs only upload `best_success_rate`. |
 | Diffusion inference steps | 4, hard-coded ⚠️ | Not a config key. `residual_ppo.py` sets `agent.inference_steps = 4` after loading, overriding the checkpoint's value. Paper Table IV: 4. |
 | `observation_type` | `state` | Must be `state`: `ResidualDiffusionPolicy` asserts it. The residual stage is state-only. |
 
@@ -492,13 +494,13 @@ The command sets no wandb entity: with `WANDB_ENTITY` exported (Implementation G
 |---|---|---|
 | `eval_interval` | 5 | Every `eval_interval`-th iteration is a deterministic evaluation: mean residual action, no update, `global_step` doesn't advance. |
 | `eval_first` | `true` | Shifts the schedule so iteration 1 is an eval, which measures the untrained residual (≈ base policy SR). |
-| `checkpoint_interval` | −1 | Save `actor_chkpt_<iteration>.pt` every N iterations. −1 = off. Each file is ~266 MB (see §5). The best-SR checkpoint is saved regardless. |
+| `checkpoint_interval` | −1 | Save `actor_chkpt_<iteration>.pt` locally every N iterations (not uploaded to wandb). −1 = off. Each file is ~266 MB (see §5). The best-SR checkpoint is saved regardless. |
 | `wandb.entity` | `null` | wandb user or team. `null` falls back to `WANDB_ENTITY` or your login's default entity. |
 | `wandb.name` | `null` | Run name, used for both the wandb run and the local `models/<name>/` folder. `null` generates `<timestamp>__residual_diffusion_ppo__<seed>`. Pick a unique name: two runs with the same name write to the same `models/` folder. Ignored when resuming with `continue_run_id`. |
 | `wandb.project` | `${env.task}-residual-rl` | wandb project, e.g. `one_leg-residual-rl`. |
 | `wandb.mode` | `online` | `online`, `offline` (sync later with `wandb sync`) or `disabled`. |
 | `wandb.notes` | `null` | Free-text notes attached to the run. |
-| `wandb.continue_run_id` | `null` | Resume an existing run by id, in `wandb.project`. It reloads that run's config, most recent checkpoint, optimizer and LR-scheduler state, iteration count and best SR. If the run doesn't exist, a fresh run starts. |
+| `wandb.continue_run_id` | `null` | Resume an existing run by id, in `wandb.project`. It reloads that run's config, its newest checkpoint in `models/<run>/` (the best-SR file from wandb if there are none on this machine), optimizer and LR-scheduler state, iteration count and best SR. If the run doesn't exist, a fresh run starts. |
 | `seed` | `null` | Random seed. `null` draws a random one, which appears at the end of the run name (`…_ppo__<seed>`). |
 | `torch_deterministic` | `false` | Sets `cudnn.deterministic`. The physics sim is not fully deterministic anyway. |
 

@@ -204,13 +204,13 @@ The early-stopper `counter` is already 1 after the first evaluation: it initiali
 
 ## 5. Checkpoints
 
-All files go to `outputs/<date>/<time>/models/<run>/` (the Hydra run directory) and are also uploaded to the wandb run's Files tab.
+All files go to `outputs/<date>/<time>/models/<run>/` (the Hydra run directory). Only `actor_chkpt_best_success_rate.pt` is also uploaded to the wandb run's Files tab; the others stay local.
 
 | File | When it's written | Selected by |
 |---|---|---|
 | `actor_chkpt_best_success_rate.pt` | After a rollout whose SR beats the best so far. Overwritten each time. | **Use this one as π_base** for Stage 2. |
 | `actor_chkpt_best_test_loss.pt` | After a validation whose test loss beats the best so far. | Rarely the best policy (§4.1). |
-| `actor_chkpt_last.pt` | End of every epoch. | Resuming (`wandb.continue_run_id`). |
+| `actor_chkpt_last.pt` | End of every epoch. | Resuming (`wandb.continue_run_id`) on this machine; it isn't uploaded. |
 | `actor_chkpt_<epoch>.pt` | Every `checkpoint_interval` epochs (500 in the experiment config). | None written in a 400-epoch run. |
 
 Each checkpoint is **~793 MB**: the model and normalizer (`model_state_dict`, ~264 MB for 66M float32 parameters), the AdamW state (2 × the parameters), the LR-scheduler state, `epoch`, `global_step` and the full resolved `config`. The optimizer state is what makes resuming exact. The residual stage only needs `model_state_dict` and `config`.
@@ -220,7 +220,7 @@ Caveats:
 - **Stale metadata fields.** The save dict is built at the start of the evaluation block, before `best_test_loss` and `best_success_rate` are updated. So a `best_*` file stores the *previous* best in those fields (e.g. `best_success_rate: 0` in the first one), even though its weights are the new best. `epoch` and `global_step` are correct.
 - **With EMA on (`training.ema.use=true`)**, validation and rollouts use the EMA weights, but the checkpoints store the raw weights. EMA is off by default.
 
-To resume a stopped run, rerun the command with `wandb.continue_run_id=<run id>`. It downloads `actor_chkpt_last.pt` from wandb, restores that run's config (your other overrides are replaced), and continues from the saved epoch with the optimizer and LR schedule intact.
+To resume a stopped run, rerun the command from the same directory with `wandb.continue_run_id=<run id>`. It restores that run's config (your other overrides are replaced) and continues from the saved epoch with the optimizer and LR schedule intact. The weights come from the newest `actor_chkpt_last.pt` under `outputs/*/*/models/<run name>/` (or `$RUN_OUTPUT_DIR` instead of `outputs`), so if two runs share a name, the newest file wins. On a machine without that file, it falls back to wandb: `actor_chkpt_last.pt` for older runs that have it, otherwise `actor_chkpt_best_success_rate.pt`, which goes back to that epoch. With neither, the run can't be resumed.
 
 ---
 

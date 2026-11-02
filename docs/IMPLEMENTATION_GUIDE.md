@@ -202,7 +202,7 @@ python -m src.train.bc +experiment=state/diff_unet task=one_leg randomness=low \
 - **Writes:**
   - Checkpoints `actor_chkpt_best_success_rate.pt`, `actor_chkpt_best_test_loss.pt` and `actor_chkpt_last.pt`. A numbered checkpoint is saved every 500 epochs, so none is written in a 400-epoch run. They go to `models/<wandb-run-name>/` inside the Hydra run directory, `outputs/<date>/<time>/` (or `$RUN_OUTPUT_DIR/<date>/<time>/`).
   - Each checkpoint holds the weights, the normalizer and the config.
-  - The same files are uploaded to the WandB run, in project `one_leg-state-low`.
+  - Only `actor_chkpt_best_success_rate.pt` is also uploaded to the WandB run, in project `one_leg-state-low`.
 
 **1d. Evaluate π_base**
 ```bash
@@ -212,7 +212,7 @@ python -m src.eval.evaluate_model --run-id <proj>/<id> --n-envs 128 --n-rollouts
 ```
 - **What it does:** runs 1024 episodes, 128 at a time, and prints `Success rate: X% (n/N)`. The target is about 50% at low randomness. `--visualize` opens the viewer.
 - **Reads:** one of:
-  - a checkpoint from a WandB run: `--run-id`, with `--wt-type` selecting the file;
+  - a checkpoint from a WandB run: `--run-id`, with `--wt-type` selecting the file (newly trained runs only upload `best_success_rate`);
   - a local file: `--wt-path <file.pt>`, which replaces both flags. Use this for the released `checkpoints/bc/one_leg/low/actor_chkpt.pt` to compare with the paper.
 - **Writes:** nothing by default. `--wandb` writes the result into the WandB run's summary.
 
@@ -368,7 +368,7 @@ python -m src.train.bc +experiment=image/real_ol_cotrain actor/diffusion_model=t
   - `sim/one_leg_render_demos/teleop/med`
   
   Check the `Using data from …` line at startup to confirm which zarrs were loaded.
-- **Writes:** the same layout as 1c, `outputs/<date>/<time>/models/<run>/`. Image training doesn't run sim evaluations, so there is no `best_success_rate` checkpoint: you get `actor_chkpt_best_test_loss.pt`, `actor_chkpt_last.pt`, and a numbered `actor_chkpt_<epoch>.pt` every 250 epochs. Files are also uploaded to WandB.
+- **Writes:** the same layout as 1c, `outputs/<date>/<time>/models/<run>/`. Image training doesn't run sim evaluations, so there is no `best_success_rate` checkpoint: you get `actor_chkpt_best_test_loss.pt`, `actor_chkpt_last.pt`, and a numbered `actor_chkpt_<epoch>.pt` every 250 epochs. These stay local: training only uploads `best_success_rate` checkpoints, so this run uploads none (see gotcha 9 in §6).
   - **Keep WandB online, or `wandb sync` offline runs:** the deployment script loads weights from WandB only.
 - **Real-only baseline:** the same command with `task=one_leg_real environment=real demo_source=teleop randomness=low`.
 
@@ -408,4 +408,4 @@ python -m src.real.minimal -p 6000 --save_dir <eval-log-dir> --run-id <proj>/<id
 6. **Lab-internal dependency.** The real-robot scripts import the authors' `rdt` package (camera streaming, Polymetis helpers, diff-IK). Expect to replace those calls with your own drivers.
 7. **Two normalizers.** π_base and π_res share the normalizer fitted on D_sim; π_real fits a new one on the combined data. Different action ranges between them are expected.
 8. **Removed evaluation flags.** `scripts/ant_local/*` pass `--controller diffik --use-new-env` to `evaluate_model.py`. Those flags no longer exist, and argparse exits with "unrecognized arguments". Drop them.
-9. **Deployment loads from WandB only.** `src/real/minimal.py` fetches weights through the WandB API (`--run-id`, `-w`) and has no local-path option. Keep π_real's run online, or `wandb sync` it before deploying.
+9. **Deployment loads from WandB only.** `src/real/minimal.py` fetches weights through the WandB API (`--run-id`, `-w`) and has no local-path option. Keep π_real's run online, or `wandb sync` it before deploying. Training only uploads `best_success_rate` checkpoints and image BC has none, so upload the checkpoint you chose to π_real's run by hand first: `wandb.init(id=<id>, project=<proj>, resume="must")`, then `wandb.save(<file>, policy="now")`. Name the file so that `-w` matches it (the default `best` matches `actor_chkpt_best_test_loss.pt`).
