@@ -488,7 +488,8 @@ python scripts/visualize_data.py plot  <data> --episodes 0         # per-episode
 | `--episodes N [N ...]` | `0` | `video`, `plot` | Episode indices to render. For a zarr, the index into `episode_ends`; for a pickle folder, the file's position in sorted order; for a single pickle, only `0` exists. `plot` always draws the overview from **all** loaded episodes; this only picks the time-series figures |
 | `--max-files N` | all | pickle folders | Load at most the first N pickles. Pickles load fully into memory, so use this on large folders |
 | `--fps N` | `30` | `video` | Playback frame rate. The data is recorded at 10 Hz, so 30 plays at 3× speed and 10 plays in real time |
-| `--out-dir DIR` | `viz` | `video`, `plot` | Output folder, created if missing. Files are named after the dataset: the randomness folder for `…/<level>/success.zarr` (e.g. `low_ep003.mp4`), otherwise the file or folder name |
+| `--out-dir DIR` | `viz` | `video`, `plot` | Parent folder, created if missing. Files go to `DIR/<run>/[<checkpoint>/]`, where `<run>` is the dataset name without a trailing `_success` or `_failure`, so a run's success and failure episodes share a folder (e.g. `viz/ol-med-own-51-bs1024_eval_vid/actor_chkpt_best_success_rate/ol-med-own-51-bs1024_eval_vid_failure_ep000.mp4`). The dataset name is the randomness folder for `…/<level>/success.zarr` (e.g. `viz/low/low_ep003.mp4`), the file name for any other zarr or a single pickle, and `<run folder>_<outcome folder>` for a folder of pickles |
+| `--checkpoint NAME` | from the path | `video`, `plot` | Checkpoint subfolder, as a name or a `.pt` path (only its stem is used). Pickle folders at `…/<run>/actor_chkpt*/<outcome>` don't need it. Use it for rollouts saved directly in `…/<run>/<outcome>`; without it, their files go straight into `DIR/<run>/` |
 
 | Command | Output |
 |---|---|
@@ -497,6 +498,7 @@ python scripts/visualize_data.py plot  <data> --episodes 0         # per-episode
 | `plot` | `<name>_ep###_timeseries.png`: EE x/y/z against the commanded target, gripper width against the open/close command. `<name>_overview.png`: EE paths (top-down and side), initial part positions, episode-length histogram |
 
 - **Both formats are treated the same.** A pickle's 8-D delta actions are turned into absolute position targets (EE position + delta), as `process_pickles.py` does, so the plots are directly comparable with zarr plots. A folder of pickles is loaded as a dataset, one episode per file in sorted order.
+- **One folder per checkpoint.** Rollout pickles don't record which checkpoint produced them, and evaluating a second checkpoint with the same `--save-rollouts-suffix` adds its pickles to the same `success/` and `failure/` folders. Include the checkpoint in the suffix to keep them apart: `--save-rollouts-suffix <run>_eval_vid/actor_chkpt_375` saves to `…/<run>_eval_vid/actor_chkpt_375/{success,failure}`, and `video` and `plot` then write to `viz/<run>_eval_vid/actor_chkpt_375/`.
 - **State-only rollouts** (all of `coverage/` and `distill/`, and any rollout saved with `--observation-space state`) have 2×2 placeholder images. `video` reports this instead of writing blank files; use `plot` or §9.3 for those.
 - **Pickle size.** Pickles with images are large (68 MB for a 146-step `factory_peg_hole` demo, up to ~1 GB for real demos) and load fully into memory; use `--max-files` on folders.
 

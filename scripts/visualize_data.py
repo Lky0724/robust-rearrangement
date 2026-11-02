@@ -9,6 +9,10 @@ Works on processed zarrs and on raw pickles (one .pkl, or a folder of them).
 <data> is a .zarr directory, a .pkl/.pkl.gz/.pkl.xz file, or a folder of pickles (e.g. raw/.../success/).
 For a folder, episodes are the files in sorted order; --max-files limits how many are loaded.
 
+Videos and plots are saved to <out-dir>/<run>/[<checkpoint>/] (default out-dir: viz), where <run> is the
+dataset name without a trailing _success or _failure, so one run's success and failure episodes share a
+folder. <checkpoint> comes from a .../<run>/actor_chkpt*/<outcome> data folder, or from --checkpoint.
+
 To watch an episode re-simulated in IsaacGym instead, use scripts/replay_in_sim.py.
 """
 
@@ -16,6 +20,7 @@ import argparse
 import gzip
 import lzma
 import pickle
+import re
 from pathlib import Path
 
 import imageio
@@ -68,6 +73,7 @@ class Dataset:
 
     def __init__(self, path: Path, max_files=None):
         self.path = path
+        self.checkpoint = None
         if path.suffix == ".zarr" or (path.is_dir() and (path / ".zgroup").exists()):
             self.kind = "zarr"
             z = zarr.open(str(path), mode="r")
@@ -103,7 +109,10 @@ class Dataset:
             self.act_pos, self.act_grip = cat("act_pos"), cat("act_grip")
             self.parts = cat("parts") if eps[0]["parts"] is not None else None
             self.success = np.array([e["success"] for e in eps])
-            self.name = path.stem if path.is_file() else f"{path.parent.name}_{path.name}"
+            run = path.parent
+            if run.name.startswith("actor_chkpt"):  # .../<run>/<checkpoint>/<outcome>
+                self.checkpoint, run = run.name, run.parent
+            self.name = path.stem if path.is_file() else f"{run.name}_{path.name}"
 
     def __len__(self):
         return len(self.ends)
@@ -181,8 +190,15 @@ def same_height(a, b):
     return np.asarray(Image.fromarray(b).resize((w, a.shape[0])))
 
 
+def run_dir(ds: Dataset, args) -> Path:
+    """<out-dir>/<run>/[<checkpoint>/]: one folder per run and checkpoint, shared by success and failure."""
+    run = re.sub(r"_(success|failure)$", "", ds.name)
+    checkpoint = Path(args.checkpoint).stem if args.checkpoint else ds.checkpoint
+    return Path(args.out_dir) / run / (checkpoint or "")
+
+
 def cmd_video(ds: Dataset, args):
-    out_dir = Path(args.out_dir)
+    out_dir = run_dir(ds, args)
     out_dir.mkdir(parents=True, exist_ok=True)
     for ep in args.episodes:
         wrist, front = ds.images(ep)
@@ -206,7 +222,7 @@ def cmd_video(ds: Dataset, args):
 
 
 def cmd_plot(ds: Dataset, args):
-    out_dir = Path(args.out_dir)
+    out_dir = run_dir(ds, args)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Per-episode time series: EE position (state vs commanded), gripper
@@ -266,7 +282,9 @@ def main():
     parser.add_argument("--episodes", type=int, nargs="+", default=[0])
     parser.add_argument("--max-files", type=int, default=None, help="Folder of pickles: load at most this many")
     parser.add_argument("--fps", type=int, default=30, help="Video fps (data is recorded at 10 Hz)")
-    parser.add_argument("--out-dir", default="viz")
+    parser.add_argument("--out-dir", default="viz", help="Parent folder; files go to <out-dir>/<run>/[<checkpoint>/]")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Checkpoint name or .pt path, for rollouts not saved under a <run>/actor_chkpt*/ folder")
     args = parser.parse_args()
 
     ds = Dataset(args.data, args.max_files)

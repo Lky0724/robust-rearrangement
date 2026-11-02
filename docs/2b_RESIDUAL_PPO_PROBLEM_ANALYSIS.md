@@ -457,8 +457,8 @@ Rollout commands:
 python -m src.eval.evaluate_model --wt-path models/ol-med-own-51-resip-2048-tw075/actor_chkpt_best_success_rate.pt \
   -f one_leg --randomness med --n-envs 20 --n-rollouts 20 --max-rollout-steps 1000 \
   --action-type pos --observation-space image --save-rollouts --save-failures \
-  --save-rollouts-suffix ol-med-own-51-resip-2048_tw075_eval_vid
-D=data/raw/diffik/sim/one_leg/rollout/med/ol-med-own-51-resip-2048_tw075_eval_vid
+  --save-rollouts-suffix ol-med-own-51-resip-2048_tw075_eval_vid/actor_chkpt_best_success_rate
+D=data/raw/diffik/sim/one_leg/rollout/med/ol-med-own-51-resip-2048_tw075_eval_vid/actor_chkpt_best_success_rate
 python scripts/visualize_data.py video $D/success --episodes 0 2 4 6 8
 python scripts/visualize_data.py video $D/failure --episodes 0 1 2
 python scripts/visualize_data.py plot $D/success --episodes 0 2 4 6 8
@@ -469,7 +469,7 @@ python scripts/visualize_data.py plot $D/failure --episodes 0 1 2
 
 ### M4 · Smoothness of saved `evaluate_model` rollouts · 2026-10-30
 
-The jerky videos were made with `src/eval/evaluate_model.py --save-rollouts` and `scripts/visualize_data.py video`, for the base as well. M4 analyzes the saved successful episodes offline (`data/raw/diffik/sim/one_leg/rollout/med/<run>_eval_vid/success/*.pkl`, made 2026-10-21 to 2026-10-28): the target pose from `actions`, the end-effector pose from `robot_state` (`ee_pos`, `ee_quat`). Ad-hoc script; no repo code involved.
+The jerky videos were made with `src/eval/evaluate_model.py --save-rollouts` and `scripts/visualize_data.py video`, for the base as well. M4 analyzes the saved successful episodes offline (`data/raw/diffik/sim/one_leg/rollout/med/<run>_eval_vid/actor_chkpt_best_success_rate/success/*.pkl`, made 2026-10-21 to 2026-10-28): the target pose from `actions`, the end-effector pose from `robot_state` (`ee_pos`, `ee_quat`). Ad-hoc script; no repo code involved.
 
 **Correction (2026-10-31).** The saved `actions` are deltas (target − EE pose at that step, `src/data_collection/io.py`), and the first version of M4 used them as the target. The target rows and the phase table below are recomputed with target = EE + delta; the EE rows were right. Main changes: the base's target was smoother and its chunk surge smaller than first reported, and most of the PPO policies' extra target motion is step-to-step back-and-forth at every phase, not the chunk surge (R6 results, which add R6 and a zigzag measure).
 
