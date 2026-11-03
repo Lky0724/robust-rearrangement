@@ -249,7 +249,7 @@ If it prints `wayland`, log out, click the gear icon on the login screen, choose
 1. Power on the FR3 Control box and wait until the arm's lights stop blinking (about a minute).
 2. In a browser on the PC, open `https://<FR3 IP>` (accept the certificate warning) and log in.
 3. **System version:** if you haven't yet, note it under *Settings → System* (§1.1).
-4. **End effector:** under *Settings → End-Effector*, select **Franka Hand**. Wrong settings here give wrong mass and gravity compensation.
+4. **End effector:** under *Settings → End-Effector*, select **Franka Hand**. Wrong settings here give wrong mass and gravity compensation. A wrist camera adds load that this profile doesn't include (§11.3).
 5. **Unlock the joints:** click the unlock (padlock) button in the side panel. You'll hear the brakes click open.
 6. **Activate FCI:** open the menu at the top right and choose **Activate FCI**. Leave the pop-up open, or note that it says FCI is active. Some FR3 versions also ask you to take "control token" ownership: accept it.
 7. **Enabling device:** keep it in your hand from now on. Know how to stop the robot with it before any program moves the arm.
@@ -935,6 +935,44 @@ Pass: two lines, each with a serial number and `USB 3.x`. `USB 2.x` means the wr
 
 Mount both cameras rigidly in their final positions now: one on the wrist, one at the front. See REAL_ROBOT_FR3_GUIDE.md §5. Route the wrist camera's cable so it can't catch on the arm when the arm moves to the home pose or rotates the gripper.
 
+To aim the cameras, watch them live. This shows every connected camera side by side, left to right in the order of the serials in the window title. Press `q` in the window to quit:
+```bash
+# (polymetis-local)
+python -c $'import numpy as np, cv2, pyrealsense2 as rs\npipes = []\nfor d in rs.context().devices:\n    s = d.get_info(rs.camera_info.serial_number)\n    p, c = rs.pipeline(), rs.config()\n    c.enable_device(s)\n    c.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)\n    p.start(c)\n    pipes.append((s, p))\nprint("cameras:", [s for s, _ in pipes], "- press q to quit")\ntry:\n    while True:\n        imgs = [np.asanyarray(p.wait_for_frames().get_color_frame().get_data()) for _, p in pipes]\n        cv2.imshow(" | ".join(s for s, _ in pipes), np.hstack(imgs))\n        if cv2.waitKey(1) & 0xFF == ord("q"):\n            break\nfinally:\n    for _, p in pipes:\n        p.stop()\n    cv2.destroyAllWindows()'
+```
+It's a single line, so the up arrow brings the whole command back.
+- `The function is not implemented ... cvShowImage` means the env has `opencv-python-headless`, which can't open windows. Install `opencv-python` instead, after checking that nothing in the env depends on the headless build.
+- A camera can be open in only one process at a time. Close this viewer before running §11.4 or teleop.
+- For Intel's GUI (exposure, depth and other settings), install `librealsense2-utils` from Intel's librealsense apt repository and run `realsense-viewer`.
+
+**Add the wrist camera to the end-effector load.** The robot compensates gravity using the load configured in Desk, and Polymetis relies on that too (`ignore_gravity=True`). The Franka Hand profile doesn't include the camera or its mount, which produces this symptom:
+
+- **`communication_test` (§3.3): the arm sinks by itself.** After reaching its start pose, the test sends zero torque for 10 s with no position feedback, so any uncompensated weight pulls the arm down.
+- **Teleop looks normal.** Joint impedance holds the arm: at the teleop `Kq` of 100 Nm/rad on joint 4, a 1 Nm error causes only about 0.01 rad (0.6°) of sag. The offset is still there, and it grows at lower stiffness, so fix the load before using low gains or deploying a residual policy.
+
+Observed on our FR3 with the camera mounted (2026-11-02): joint 4 sank from −2.356 to −2.554 rad (about 11°), while the other joints stayed near their targets. The robot reported `m_ee` = 0.73 kg and `m_load` = 0 kg. It estimated about 0.9 Nm of external torque on joint 4 and about 2.9 N at the end effector, roughly 0.3 kg. Treat those two estimates as rough: joint 1 also read about 0.55 Nm, although gravity should exert no torque about its vertical axis.
+
+The fix below hasn't been run on the robot yet. To confirm the cause first, take the camera off and rerun `communication_test`. If the arm still sinks, check for cable tension and anything else mounted on the hand.
+
+1. **Weigh the camera and mount together**, including any cable the arm carries. Call this `m_cam`.
+2. **Estimate their center of mass** in the flange frame, `r_cam`. For the nominal mount, at (−0.05, 0, 0.04) m in `panda_hand`, which is rotated −45° about z from the flange, start from `r_cam ≈ (−0.035, 0.035, 0.04)` m. Adjust it for your mount.
+3. **Combine them with the hand:**
+   ```
+   m_total = 0.73 + m_cam
+   CoM     = (0.73 × [-0.01, 0, 0.03] + m_cam × r_cam) / m_total
+   ```
+4. **Enter the values in Desk** under *Settings → End-Effector*. A rough inertia is fine, because the mass and center of mass matter most here. If the Franka Hand profile can't be edited and you switch to a custom profile, note the current `F_T_EE` first (0.1034 m along z, rotated 45° about z), enter it again, and check that the gripper still works.
+5. **Check the result** with Polymetis stopped. `m_total` and `F_x_Ctotal` should show the new values. This command only reads state:
+   ```bash
+   ~/fr3_test/libfranka/build/examples/echo_robot_state $FR3_IP | grep -oE '"(m_ee|m_load|m_total|F_x_Ctotal)": ?(\[[^]]*\]|[^,}]*)' | tail -4
+   ```
+6. **Rerun `communication_test`** with a hand on the stop button. The arm should now stay close to its start pose for the full 10 s.
+
+If Desk can't take these values, keep the Franka Hand profile and add only the camera as a payload, using `r_cam` and a rough inertia `I_cam`. Polymetis doesn't call `setLoad` itself, so add this after `robot_ptr_.reset(...)` in `franka_panda_client.cpp` (§4.3) and rebuild (§4.4). This patch hasn't been tested:
+```cpp
+robot_ptr_->setLoad(m_cam, r_cam, I_cam);  // std::array<double, 3> r_cam; std::array<double, 9> I_cam (column-major)
+```
+
 ### 11.4 Tell them apart and enter the serials
 
 This saves one picture from each camera, named after its serial:
@@ -1048,6 +1086,7 @@ Once everything above passes, a session is:
 | `Couldn't resolve requests` / no frames, with cameras attached | Camera on USB 2, or wrong serial | Use a USB 3 port (§11.2); check `serials.py` (§11.4) |
 | `Couldn't get frame for device` during teleop | Camera dropped out: USB 2, a loose cable, or too many devices on one USB controller | USB 3 port, secure the cable, put the cameras on different ports |
 | Wrist and front swapped in the video | Serials swapped | Swap them in `serials.py` |
+| Arm sinks by itself during `communication_test`'s zero-torque phase, but teleop looks normal | Wrist camera and mount aren't in the Desk load; teleop's joint impedance hides the error | §11.3 |
 
 ---
 

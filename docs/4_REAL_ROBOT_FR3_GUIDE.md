@@ -623,7 +623,7 @@ The local `KeyboardInterface.get_action()` returns `(action, enum)`, with the ro
 
 ### Step 7. Mount the cameras and build the scene
 
-1. Mount the wrist and front cameras **rigidly** (§5.1), roughly where sim puts them. From now until the rollouts are finished, don't touch them.
+1. Mount the wrist and front cameras **rigidly** (§5.1), roughly where sim puts them. From now until the rollouts are finished, don't touch them. Then add the wrist camera and mount to the end-effector load in Desk, because the Franka Hand profile doesn't include them. See [4_FR3_ORIGINAL_CODE_TELEOP_TEST.md §11.3](4_FR3_ORIGINAL_CODE_TELEOP_TEST.md#113-mount).
 2. Place the fixture and parts per §5.2.
 3. Record both cameras' intrinsics at 640×480 and write them into `isaac_lab_rerender.py`. Measure the front camera pose and the wrist offset roughly; you'll refine them in Step 10.
 
