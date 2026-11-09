@@ -226,6 +226,8 @@ class RLPolicyEnvWrapper:
         torque_threshold=0.5,
         terminate_torque_ratio=None,
         min_insert_twist_turns=None,
+        min_held_twist_turns=None,
+        max_insert_base_move_mm=None,
         device="cuda",
     ):
         self.env = env
@@ -274,14 +276,38 @@ class RLPolicyEnvWrapper:
         # its long axis while within `insert_radius` of an assembled position. Otherwise the
         # assembled pose was reached by forcing the part in, and the episode fails (latched).
         self.min_insert_twist_turns = min_insert_twist_turns
+        # Two more checks, latched the same way:
+        # - min_held_twist_turns: as above, but only steps where the gripper holds the part count,
+        #   so turning it by pushing with the fingertips doesn't
+        # - max_insert_base_move_mm: the base part's peak horizontal move after the tracked part
+        #   first comes within `insert_radius` must stay below this
+        self.min_held_twist_turns = min_held_twist_turns
+        self.max_insert_base_move_mm = max_insert_base_move_mm
         self.insert_radius = 0.03  # the threads span the last ~2 cm
-        if self.min_insert_twist_turns is not None:
-            if not self.track_safety:
-                raise ValueError("min_insert_twist_turns needs an env with part and EE states")
+        # Gripper width (m) that counts as holding the part: the square_table leg is ~3 cm wide,
+        # the gripper closed on nothing ~0 and open 8 cm
+        self.held_width = (0.02, 0.036)
+        # The insertion diagnostics are logged whether or not the checks are on
+        self.track_insertion = self.track_safety and all(
+            hasattr(self.env, attr) for attr in ("assembled_rel_poses", "gripper_width")
+        )
+        checks = (min_insert_twist_turns, min_held_twist_turns, max_insert_base_move_mm)
+        if any(c is not None for c in checks) and not self.track_insertion:
+            raise ValueError("The insertion success checks need an env with part and EE states")
+        if self.track_insertion:
             # Assembled positions of the tracked part in the base part's frame
             self.assembled_pos = self.env.assembled_rel_poses[0, :, :3, 3].to(self.device)
         self.insert_twist = torch.zeros(self.env.num_envs, device=self.device)
         self.twist_failed = torch.zeros_like(self.force_failed)
+        self.held_twist = torch.zeros_like(self.insert_twist)
+        self.held_twist_failed = torch.zeros_like(self.force_failed)
+        # Base part's horizontal position when the tracked part first came within insert_radius
+        # (NaN before), and its peak horizontal distance from there (m)
+        self.base_anchor = torch.full(
+            (self.env.num_envs, 2), float("nan"), device=self.device
+        )
+        self.peak_base_move = torch.zeros_like(self.insert_twist)
+        self.base_move_failed = torch.zeros_like(self.force_failed)
 
         self.env_success = torch.zeros(
             self.env.num_envs, device=self.device, dtype=torch.bool
@@ -323,6 +349,11 @@ class RLPolicyEnvWrapper:
         self.succeeded = torch.zeros_like(self.force_failed)
         self.insert_twist = torch.zeros(self.num_envs, device=self.device)
         self.twist_failed = torch.zeros_like(self.force_failed)
+        self.held_twist = torch.zeros_like(self.insert_twist)
+        self.held_twist_failed = torch.zeros_like(self.force_failed)
+        self.base_anchor = torch.full((self.num_envs, 2), float("nan"), device=self.device)
+        self.peak_base_move = torch.zeros_like(self.insert_twist)
+        self.base_move_failed = torch.zeros_like(self.force_failed)
         return obs
 
     def _safety_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -410,24 +441,57 @@ class RLPolicyEnvWrapper:
                 termination = termination | self.force_failed
                 info["force_failed"] = self.force_failed.clone()
 
+        if self.track_insertion:
+            inserting = (
+                (info["part_rel_pos"].unsqueeze(1) - self.assembled_pos)
+                .norm(dim=-1)
+                .min(dim=1)
+                .values
+                < self.insert_radius
+            )
+            self.insert_twist += torch.where(inserting, info["part_twist"], 0.0)
+            width = self.env.gripper_width().view(-1)
+            held = inserting & (width > self.held_width[0]) & (width < self.held_width[1])
+            self.held_twist += torch.where(held, info["part_twist"], 0.0)
+            base_xy = self.env.rb_states[self.env.furniture_rb_indices][
+                :, self.base_part_idx, :2
+            ]
+            first_insert = inserting & self.base_anchor.isnan().any(dim=-1)
+            self.base_anchor = torch.where(
+                first_insert.unsqueeze(1), base_xy, self.base_anchor
+            )
+            self.peak_base_move = torch.maximum(
+                self.peak_base_move,
+                torch.nan_to_num((base_xy - self.base_anchor).norm(dim=-1), nan=0.0),
+            )
+            info["held_twist"] = self.held_twist.clone()
+            info["peak_base_move"] = self.peak_base_move.clone()
+
+            # Checked on the step the env reports the part as newly assembled (reward > 0).
+            # The env stays done afterwards and pays that reward only once, so a failed
+            # env gets no success reward. Twists by magnitude only, so the checks don't depend
+            # on the threads' handedness or the axis' sign convention.
+            assembled = reward > 0
             if self.min_insert_twist_turns is not None:
-                inserting = (
-                    (info["part_rel_pos"].unsqueeze(1) - self.assembled_pos)
-                    .norm(dim=-1)
-                    .min(dim=1)
-                    .values
-                    < self.insert_radius
-                )
-                self.insert_twist += torch.where(inserting, info["part_twist"], 0.0)
-                # Checked on the step the env reports the part as newly assembled (reward > 0).
-                # The env stays done afterwards and pays that reward only once, so a failed
-                # env gets no success reward. Magnitude only, so the check doesn't depend on
-                # the threads' handedness or the axis' sign convention.
-                self.twist_failed |= (reward > 0) & (
+                self.twist_failed |= assembled & (
                     self.insert_twist.abs() < self.min_insert_twist_turns * 2 * torch.pi
                 )
-                reward = torch.where(self.twist_failed, 0.0, reward)
                 info["twist_failed"] = self.twist_failed.clone()
+            if self.min_held_twist_turns is not None:
+                self.held_twist_failed |= assembled & (
+                    self.held_twist.abs() < self.min_held_twist_turns * 2 * torch.pi
+                )
+                info["held_twist_failed"] = self.held_twist_failed.clone()
+            if self.max_insert_base_move_mm is not None:
+                self.base_move_failed |= assembled & (
+                    self.peak_base_move > self.max_insert_base_move_mm / 1000
+                )
+                info["base_move_failed"] = self.base_move_failed.clone()
+            reward = torch.where(
+                self.twist_failed | self.held_twist_failed | self.base_move_failed,
+                0.0,
+                reward,
+            )
 
         # Keep the task reward (0/1 per assembled pair, minus force failures) for success statistics
         info["task_reward"] = reward.clone()

@@ -39,6 +39,7 @@ actor:
   residual_policy:
     pretrained_wts: null
     pretrained_load_optim: true  # false: load only the weights from pretrained_wts, start a fresh optimizer and LR schedule
+    pretrained_logstd: null  # set the log std after loading pretrained_wts, whose own value replaces init_logstd; null keeps it
     init_logstd: -1.0
     learn_std: false
 
@@ -90,6 +91,13 @@ safety:
   # reward, done). Screwing the leg in takes ~1.19 turns, forcing it in ~0.26 (one_leg).
   # null disables it (paper setting).
   min_insert_twist_turns: null
+  # The same, but only steps where the gripper holds the part (width 2-3.6 cm) count, so turning
+  # it by pushing with the fingertips doesn't. Demos twist >= 0.93 turns while held. null disables it.
+  min_held_twist_turns: null
+  # Success also requires the base part (table top) to move at most this far horizontally (peak,
+  # mm) after the inserted part first comes within 3 cm of an assembled position. Demo peaks:
+  # median 5 mm, 90% <= 12 mm, max 35 mm. The push into the fixture before that is allowed. null disables it.
+  max_insert_base_move_mm: null
 
 # Calculate the batch size as the data collection steps times the number of environments
 batch_size: ${eval:'${data_collection_steps} * ${num_envs}'}
