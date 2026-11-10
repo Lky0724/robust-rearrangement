@@ -195,7 +195,7 @@ The task level is a label: only the base task corresponds to a simulator environ
 
 The same level name means different things in the two simulator environments:
 - **RL env** (`FurnitureRLSimEnv`, [furniture_rl_sim_env.py:1692](../furniture-bench/furniture_bench/envs/furniture_rl_sim_env.py#L1692)) puts the parts at their nominal poses and pushes each one with a random horizontal force and twist at reset. It also offsets the fixture and adds noise to the arm's starting joints. It is used for **RL training, evaluation, rollouts and SpaceMouse demo collection**: [data_collector_sm.py](../src/data_collection/data_collector_sm.py) has created this env since 2024-05-15, and the released `one_leg` teleop demos were recorded on 2024-05-16 to 05-28, so they very likely share evaluation's initial-state distribution.
-- **Original FurnitureBench env** (`FurnitureSimEnv`, [furniture_sim_env.py:1349](../furniture-bench/furniture_bench/envs/furniture_sim_env.py#L1349)) places each part uniformly at random around its nominal pose. It is used by `furniture_bench.scripts.run_sim_env` and the older scripted collector ([data_collector.py](../src/data_collection/data_collector.py)).
+- **Original FurnitureBench env** (`FurnitureSimEnv`, [furniture_sim_env.py:1349](../furniture-bench/furniture_bench/envs/furniture_sim_env.py#L1349)) places each part uniformly at random around its nominal pose. It is used by `furniture_bench.scripts.run_sim_env` and both scripted collectors ([data_collector.py](../src/data_collection/data_collector.py), [data_collector_v2.py](../src/data_collection/data_collector_v2.py)).
 
 | Level | Original env: part position / yaw | RL env: fixture offset | RL env: max push force / torque | RL env: joint noise | In the paper |
 |---|---|---|---|---|---|
@@ -214,6 +214,7 @@ Push forces are scaled per part (for `one_leg`, ×25 for the heavier tabletop, �
 |---|---|
 | Sim teleop ([teleop.py](src/data_collection/teleop.py)) | `raw/<ctrl>/sim/<task>/teleop/<rand>[_perturb]/{success,failure}/` |
 | Rollouts (`evaluate_model --save-rollouts [--save-rollouts-suffix S]`) | `raw/diffik/sim/<task>/rollout/<rand>/[S/]{success,failure}/` |
+| Scripted demos ([scripted.py](src/data_collection/scripted.py), [data_collector_v2.py](src/data_collection/data_collector_v2.py), `--suffix S`) | `raw/<ctrl>/sim/<task>/scripted/<rand>/[S/]{success,failure}/` |
 | Real teleop ([teleop_sm.py](src/real/teleop_sm.py)) and re-rendering ([isaac_lab_rerender.py](src/sim2real/isaac_lab_rerender.py)) | Whatever `--save_dir` / `--save-dir` you give. Point it at the matching `raw/…/success/` folder so processing can find it |
 | `process_pickles -c C -d D -f F -s S -r R -o O [--suffix X] [--output-suffix Y]` | Reads `raw/C/D/F/S/R/[X/]O/*.pkl*`; writes `processed/C/D/F/S/R/O[/Y].zarr` |
 
@@ -399,6 +400,42 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 | Length | T+1 observations (sim) | Last observation dropped so it lines up with T actions |
 
 Conventions are shared across stages. Rotations are converted in [src/common/geometry.py](src/common/geometry.py), with quaternions in xyzw order. Images are resized again to 224×224 inside the model.
+
+### Cutting one phase out of `one_leg` demos
+
+The `skills` annotations are empty in `one_leg` data, so [src/data_processing/segment_demos.py](src/data_processing/segment_demos.py) detects the phases from `parts_poses` and the gripper action. Both inputs use the same detector:
+
+```bash
+# Zarr → .../teleop/low/success/insert.zarr, train with data.suffix=insert
+python -m src.data_processing.segment_demos processed data/processed/diffik/sim/one_leg/teleop/low/success.zarr
+
+# Pickles → .../teleop/low/insert/success/*.pkl, then convert them
+python -m src.data_processing.segment_demos raw data/raw/diffik/sim/one_leg/teleop/low/success
+python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s teleop -r low -o success --suffix insert --output-suffix insert
+```
+
+| `--phase` | From | To |
+|---|---|---|
+| `setup` | Start of the demo | Leg grasped |
+| `transport` | Leg grasped | Leg stays within `--start-radius` of the hole it ends up in |
+| `insert` (default) | End of `transport` | First gripper release with the leg in a hole, so the gripper is closed throughout |
+| `screw` | That release | End of the demo |
+
+| Option | Default | Effect |
+|---|---|---|
+| `--start-radius` | `0.05` | Lateral distance from the hole where `insert` starts, in meters. Larger values keep more of the transport |
+| `--near-lateral`, `--near-axial` | `0.02` | How close to the seated pose a release must be to count as inserted, in meters |
+| `--pre-steps`, `--post-steps` | `0` | Extra steps around the phase. `--post-steps 10` keeps the release |
+| `--output`, `--output-suffix` | path grammar, `insert` | Where to write. The defaults keep the data out of what training reads without a suffix |
+| `--dry-run` | off | Print each episode's segment and write nothing |
+
+Episodes without an insertion (no release near a hole, or no `parts_poses`) are skipped and listed. Each output records its segments: `attrs["segment"]` in a zarr, `data["segment"]` in a pickle.
+
+Things to know before using a segment:
+
+- **The two routes differ in their rotation actions.** Everything else is identical, but the episode-wide rotation scaling (§11, pitfall 4) depends on the array it is given. A segmented zarr keeps the factor of its full demo, and a segmented pickle is scaled over the segment only, so it gets a larger factor (about 1.0 instead of about 0.1 in our `med` teleop pickles). Don't mix the two routes in one dataset. The released `one_leg` teleop zarrs have no raw pickles on S3, so they can only use the zarr route.
+- **Segments are short for the default horizons.** `insert` has a median of about 40 steps, and with `pred_horizon=32`, `action_horizon=8` the last 24 steps of an episode never appear as an observation, which is most of the insertion. On `teleop/low` that leaves 858 samples from 2057 steps, and 2 of the 50 episodes contribute none. `pred_horizon=16` gives 1657 samples and `pred_horizon=8` gives all 2057.
+- **Evaluation still starts from a full reset.** A policy trained on `insert` only has seen no grasp or transport, so the success rate from `bc.py`'s evaluation doesn't measure it.
 
 ---
 
@@ -693,7 +730,7 @@ Always pass `--max-rollout-steps`. Without it the timeout comes from [tasks.py](
 
 **Perturbations during the episode (paper Fig. 9)** can't be enabled from the command line. [rollout.py:190](../src/eval/rollout.py#L190) hard-codes `env.step(action, sample_perturbations=False)`. Changing it to `True` makes each step push about 1% of parts with the level's force and torque limits. The paper reports that ResiP loses 12 points under perturbation and chunked policies 19–26. The RL training wrapper has its own switch (`sample_perturbations` in [env_rl_wrapper.py](../src/gym/env_rl_wrapper.py)).
 
-**Demos and evaluation use the same randomization.** The SpaceMouse collector creates the same RL env with the same `--randomness` (§2.2), and the released `one_leg` demos were recorded after it switched to that env. Demos collected with the older scripted collector or `run_sim_env` use the original env's uniform placement instead.
+**Demos and evaluation use the same randomization.** The SpaceMouse collector creates the same RL env with the same `--randomness` (§2.2), and the released `one_leg` demos were recorded after it switched to that env. Demos collected with the scripted collectors or `run_sim_env` use the original env's uniform placement instead.
 
 #### Notes
 
@@ -712,12 +749,13 @@ Always pass `--max-rollout-steps`. Without it the timeout comes from [tasks.py](
 
 ## 10. Collecting demonstrations
 
-The repo has three collectors. Only the SpaceMouse simulation collector was used for the released demos.
+The repo has four collectors. Only the SpaceMouse simulation collector was used for the released demos.
 
 | Collector | Command | Environment | Status |
 |---|---|---|---|
 | **Simulation, SpaceMouse** (+ keyboard) | `python -m src.data_collection.teleop` ([teleop.py](../src/data_collection/teleop.py) → [data_collector_sm.py](../src/data_collection/data_collector_sm.py)) | `FurnitureRLSimEnv`, the same env as RL and evaluation | Used for the released demos (since 2024-05-15). Starts on this machine (2026-10-07) |
-| Simulation, scripted | `python -m src.data_collection.scripted` ([scripted.py](../src/data_collection/scripted.py)) | Original `FurnitureSimEnv`, OSC controller, FurnitureBench's hard-coded assembly script | **Doesn't start as written**: it calls `trajectory_save_dir(environment=…)` without `controller`, which don't match the function's arguments (§10.7) |
+| Simulation, scripted | `python -m src.data_collection.scripted` ([scripted.py](../src/data_collection/scripted.py) → [data_collector.py](../src/data_collection/data_collector.py)) | Original `FurnitureSimEnv`, diffik controller, FurnitureBench's hard-coded assembly script | Works on this machine (2026-10-20). Episodes take about 600–700 steps (§10.7) |
+| Simulation, scripted v2 (`one_leg`) | `python -m src.data_collection.data_collector_v2` ([data_collector_v2.py](../src/data_collection/data_collector_v2.py)) | Original `FurnitureSimEnv`, diffik controller, a reworked `one_leg` expert | Works on this machine (2026-11). About 500 steps to success plus about 50 to return (§10.7) |
 | Real robot, SpaceMouse | `python -m src.real.teleop_sm` ([teleop_sm.py](../src/real/teleop_sm.py)) | Franka + two RealSense cameras | Needs the authors' internal `rdt` package (§10.7) |
 
 ### 10.1 Setup
@@ -905,7 +943,57 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 
 ### 10.7 Other collectors
 
-**Scripted (`scripted.py`).** Meant to generate demos without a human, using FurnitureBench's hard-coded assembly script in the original `FurnitureSimEnv` with the OSC controller. It fails before collecting anything: it calls `trajectory_save_dir(environment="sim", …)`, but the function takes `controller` (required) and `domain`, not `environment`. The authors' demos weren't collected this way.
+**Scripted (`scripted.py`).** Generates demos without a human, using FurnitureBench's hard-coded assembly script (`get_assembly_action`, [furniture_sim_env.py:1571](../furniture-bench/furniture_bench/envs/furniture_sim_env.py#L1571)) in the original `FurnitureSimEnv`. The authors' demos weren't collected this way. The script is a finite state machine per part that reads the true part poses from the simulator, so it only runs with one env at a time (about 35 s per demo here) and can't be queried from an arbitrary state, which rules it out as a DAgger teacher. It writes pickles in the same format as teleop, to `raw/<ctrl>/sim/<task>/scripted/<rand>/[<suffix>/]{success,failure}/`.
+
+```bash
+python -m src.data_collection.scripted -f one_leg -r low -n 100 --headless --save-failure --save-mp4
+python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s scripted -r low -o success
+```
+
+| Option | Default | Effect |
+|---|---|---|
+| `-f`, `--furniture` | required | `one_leg`, `lamp`, `round_table` or `cabinet` (the only tasks with a script) |
+| `-r`, `--randomness` / `-n`, `--num-demos` / `-g`, `--gpu-id` | `low` / `100` / `0` | Randomness level, successful demos to collect, GPU |
+| `-c`, `--ctrl-mode` | `diffik` | `osc` is the FurnitureBench default, but the rest of the pipeline uses diffik |
+| `--keep-april-tags` | off | Load the part meshes with AprilTags. By default the tagless meshes are used, as in the RL env |
+| `--save-failure` | off | Also keep failed episodes, in `failure/`. Without it they are dropped and the episode reruns |
+| `--save-mp4` | off | Write a wrist \| front video next to each pickle, from the 240×320 frames in it, at 10 fps |
+| `--suffix S` | none | Extra folder level before `success/`, read by `process_pickles --suffix S` |
+
+- **Initial states differ from evaluation.** `FurnitureSimEnv` places parts uniformly around their nominal poses and never moves the fixture, while evaluation runs in `FurnitureRLSimEnv` (§2.2, Randomness levels).
+- **Episodes run close to the timeout.** `one_leg` demos take about 600–700 steps against a 700-step limit (`sim_config["scripted_timeout"]`), so slow episodes fail. Most of the time goes to waiting: about 60% of steps barely move, mostly in phase timeouts and 5–6 regrasp cycles of 90° each.
+- **The tabletop often ends short of the fixture corner.** The push releases within 2 cm of the target, and the tabletop pivots in the gripper when a corner touches a wall; in two `med` demos it ended 12 and 64 mm from the corner.
+- **`parts_poses` is padded to 42D.** `FurnitureSimEnv` reports only the 5 parts, so the collector appends the fixture pose in the AprilTag frame, matching the RL env's layout.
+
+**Scripted v2 (`data_collector_v2.py`).** A copy of the scripted collector with a reworked `one_leg` expert. It replaces the leg's and tabletop's FSMs at runtime, so furniture-bench is unchanged; other furniture still runs the stock script. Options are the same as `scripted.py`, plus:
+
+| Option | Default | Effect |
+|---|---|---|
+| `--max-env-steps N` | `1000` | Steps allowed to finish the assembly (the stock limit is 700) |
+| `--no-return-home` | off | End the episode at success instead of returning to the centered pose |
+
+```bash
+python -m src.data_collection.data_collector_v2 -f one_leg -r med -n 100 --headless --save-failure --save-mp4 --suffix v2
+python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s scripted -r med -o success --suffix v2
+```
+
+What changes compared to the stock script:
+
+- **Blended motion.** Translation, rotation and height move together instead of through separate xy, turn and descend phases. The arm comes down as it lines up with a part, carries the leg up, upright and toward the hole in one move, and skips the stock script's fixed waypoints. Per-step limits are 2.5 cm and 30°, up from 2 cm and 15°.
+- **180° per regrasp.** The leg is grasped at +90° yaw and turned to −90°, so screwing takes 3 regrasps instead of 5–6. Joint 7 stays within about −0.9 to 2.6 rad (limit ±2.9).
+- **The gripper waits for the arm.** It opens or closes only after the arm has reached its target and held still for 2 steps, not when a phase times out.
+- **The tabletop goes into the corner.** The push controls the tabletop's own pose: it squares it up 1.5 cm clear of both walls, presses it into the corner and stops when the walls stop it. While screwing, the gripper's x and y are held still so the leg can't drag the tabletop out again.
+- **Return to a centered pose after success.** The gripper stops, opens, rises off the leg and sweeps to `HOME_POS` (0.5, 0, 0.2) pointing straight down at yaw 0, in one motion. These steps are recorded, so success is no longer the last step of a demo.
+
+Measured on `med` (2026-11): 30/30 successes, 479–535 steps to success (median 499, stock script about 666), 52 more steps to return, so 540–573 steps per demo. `low` and `med` both convert to zarr.
+
+- **Some steps are deliberately slow.** Turning the leg faster than about 3°/step stops the thread from catching. After the insertion the tilted gripper straightens up slowly, because swinging upright fast knocks the just-seated leg out of the hole. After letting go of the tabletop the gripper only turns once it has risen clear, or the fingers knock the tabletop out of the corner.
+- **The tabletop can still drift during screwing.** It is pressed into the corner when released, but in 9 of 30 episodes it had moved more than 6 mm along the front wall by the time of success (at most 47 mm). They still succeeded. The cause isn't verified.
+- **Rotations get scaled down hard in processing.** These demos rotate a lot, so the episode-wide rotation scaling (§11, pitfall 4) shrinks them more than in teleop data: about 30° steps become roughly 2° and 15° steps roughly 1° (an estimate, not measured). A policy trained on them may turn too slowly to finish screwing.
+- **Less variety than the stock script.** It drops the per-step action jitter during insertion and the fixed waypoints, and its grasp noise is smaller, so demos are more alike.
+- **One unexplained failure.** In 1 of 44 episodes with an earlier version, the tabletop was released 17 mm off and the wrist turned to joint 7's limit. It hasn't recurred in 36 episodes of this version.
+- **Not tested** with `high` randomness or the `osc` controller.
+- **Don't kill a run while it writes a pickle.** The truncated `.pkl.xz` makes `process_pickles` fail; delete it (`xz -t` finds it).
 
 **Real robot (`src/real/teleop_sm.py`).** Same SpaceMouse scheme on a real Franka (Polymetis) with two RealSense D435 cameras, with a meshcat visualization.
 
@@ -1094,3 +1182,4 @@ Run these with `RESIP_ROBOT_URDF` (and `RESIP_ROBOT_FLIP_VISUALS`) set and `LD_L
 5. **State-only rollouts have 2×2 placeholder images.** This covers everything in `coverage/` and `distill/`, and any rollout saved with `--observation-space state`. Some processed rollout zarrs do have real IsaacGym images (e.g. `rppo_low_*`, `bc_low_*`). Check with `scripts/visualize_data.py info` before training an image policy.
 6. **Real teleop marks every saved demo as a success.** Filter bad demos yourself before processing.
 7. **Watch the size of large zarrs.** By default (`data.load_into_memory=true`, [bc.py:202](src/train/bc.py#L202)), `ImageDataset` copies all images into RAM, so a 30 GB render needs about that much memory. Set `data.load_into_memory=false` to keep images on disk and read them from the zarr per sample.
+8. **Some recorded tabletop quaternions are wrong.** When the tabletop sits almost exactly at its nominal orientation, a recorded quaternion can jump from about `(0, .707, -.707, 0)` to `(0, .707, .707, 0)`, which is the same pose turned upside down, for a single step. This affects 66 of the 76,389 steps in the released `one_leg` teleop zarrs, in 16 of the 150 episodes. The cause isn't verified. Those values go into the state policy's observations unchanged. `segment_demos.py` corrects them for its own detection and leaves the stored data as it is. Anything that computes a pose relative to the tabletop has to handle them too.
