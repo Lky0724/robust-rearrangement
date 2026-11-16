@@ -12,6 +12,9 @@ Differences from data_collector.py, all done here by swapping the part FSMs at r
   - Screw: each grasp turns the leg 180 degrees (+90 -> -90) instead of 90, so the gripper opens and closes less.
   - Gripper timing: only opens/closes once the arm has reached its target and stopped, not when a phase times out.
   - Tabletop: squared up to the fixture, then pressed into the corner, closing the loop on the tabletop's own pose.
+  - Hole: the leg goes into whichever of the tabletop's 4 holes is nearest the fixture corner, not always the same
+    one. The RL env's reset kick can turn the tabletop past 45 degrees, and squaring it up then puts leg4's own hole
+    at another corner.
   - After success: opens the gripper and sweeps to a centered pose, gripper square to the workspace, in one motion.
   - Smoothing: the commanded target moves toward where the expert wants to go with bounded speed and acceleration,
     close to the sim teleop demos, so moves ease in and out and joint 7 stays well under the robot's limit.
@@ -339,6 +342,39 @@ def _settled(part, at_target):
     return part._v2_settled >= SETTLE_STEPS
 
 
+def _hole_nearest_corner(
+    holes, table_pose, rb_states, part_idxs, sim_to_april_mat, april_to_robot
+):
+    """Of the tabletop's holes (4x4 poses in its own frame), the one nearest the fixture's inner corner.
+
+    That is where the front and left walls meet, the corner the tabletop is pressed into. table_pose is in the
+    AprilTag frame.
+    """
+    device = table_pose.device
+
+    def wall(name):
+        state = rb_states[part_idxs[name]][0]
+        return (
+            april_to_robot
+            @ sim_to_april_mat
+            @ C.to_homogeneous(state[:3], C.quat2mat(state[3:7]))
+        )
+
+    corner = torch.stack(
+        [
+            wall("obstacle_front")[0, 3] - WALL_HALF_THICKNESS,
+            wall("obstacle_left")[1, 3] - WALL_HALF_THICKNESS,
+        ]
+    )
+    dists = torch.stack(
+        [
+            ((april_to_robot @ table_pose @ hole.to(device))[:2, 3] - corner).norm()
+            for hole in holes
+        ]
+    )
+    return holes[int(dists.argmin())].to(device)
+
+
 def _leg_fsm_step(
     self,
     ee_pos,
@@ -368,13 +404,20 @@ def _leg_fsm_step(
     )
     leg_pose_robot = april_to_robot @ leg_pose
     leg_pos_robot = leg_pose_robot[:3, 3]
-    hole = (
-        april_to_robot
-        @ table_pose
-        @ torch.tensor(
-            get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]), device=device
-        ).float()
-    )
+    # Pick the hole once, as the leg phase starts, so it can't flip between two holes while the tabletop moves.
+    # Its position still follows the tabletop every step.
+    if (self._state == "reach_leg_floor_xy" and steps == 0) or getattr(
+        self, "_v2_hole", None
+    ) is None:
+        self._v2_hole = _hole_nearest_corner(
+            self._v2_holes,
+            table_pose,
+            rb_states,
+            part_idxs,
+            sim_to_april_mat,
+            april_to_robot,
+        )
+    hole = april_to_robot @ table_pose @ self._v2_hole
     tilt = torch.tensor(rot_mat([0, -np.pi / 5, 0], hom=True), device=device).float()
 
     def leg_pose_for_hole():
@@ -697,6 +740,12 @@ def patch_expert(furniture, aim_gain=YAW_GAIN):
 
     for part in furniture.parts:
         if isinstance(part, SquareTableLeg):
+            # The tabletop's 4 holes in its own frame, the same ones the success check accepts
+            part._v2_holes = [
+                torch.tensor(get_mat(rel[:3, 3], [0.0, 0.0, 0.0])).float()
+                for rel in furniture.assembled_rel_poses[(0, part.part_idx)]
+            ]
+            part._v2_hole = None
             part.fsm_step = keep_goal(types.MethodType(_leg_fsm_step, part))
             # The stock script jitters the action during these states, which also shakes the leg as it is let go
             part.state_no_noise = lambda: False
@@ -1187,6 +1236,7 @@ class DataCollector:
             # Our own per-state step counters, so a stale count can't carry into the next episode
             for part in self.env.furniture.parts:
                 part._v2_state = None
+                part._v2_hole = None
         if self.shaper is not None:
             self.shaper.reset(*_ee_pose_np(self.env))
         self._append_obstacle_pose(obs)
