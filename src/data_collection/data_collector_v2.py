@@ -2,6 +2,10 @@
 
     python -m src.data_collection.data_collector_v2 -f one_leg -r med -n 100 --headless --save-failure --save-mp4
 
+By default it runs in FurnitureRLSimEnv, the env teleop, training and evaluation use: the same low/med/high
+randomization, physics stepped for the full 0.1 s per action, and --sample-perturbations to push parts during the
+episode. --env sim uses FurnitureSimEnv like data_collector.py, which only steps half the physics time per action.
+
 Differences from data_collector.py, all done here by swapping the part FSMs at runtime (furniture-bench is untouched):
   - Motion: moves blend translation, rotation and height instead of going through separate xy, turn and descend
     phases and fixed waypoints. Larger per-step limits make the arm about twice as fast at turning.
@@ -9,6 +13,8 @@ Differences from data_collector.py, all done here by swapping the part FSMs at r
   - Gripper timing: only opens/closes once the arm has reached its target and stopped, not when a phase times out.
   - Tabletop: squared up to the fixture, then pressed into the corner, closing the loop on the tabletop's own pose.
   - After success: opens the gripper and sweeps to a centered pose, gripper square to the workspace, in one motion.
+  - Smoothing: the commanded target moves toward where the expert wants to go with bounded speed and acceleration,
+    close to the sim teleop demos, so moves ease in and out and joint 7 stays well under the robot's limit.
 """
 import argparse
 import lzma
@@ -42,10 +48,34 @@ from src.gym import turn_off_april_tags
 from src.visualization.render_mp4 import pickle_data, create_mp4, data_to_video
 
 
-# Per-step action limits. Commanded motion sets the speed in this controller: the arm covers about a fifth of a
-# commanded turn and a third of a commanded move per step. process_pickles clips position deltas to 2.5 cm per axis.
+# Per-step limits on the expert's raw action, before smoothing. process_pickles clips position deltas to 2.5 cm per axis.
 POS_BOUND_M = 0.025
 ORI_BOUND_DEG = 30
+
+# Smoothing. The expert's FSMs only say where to go: a reference pose moves there with these limits, close to the
+# sim teleop demos (up to 0.12 m/s and 0.96 rad/s, joint 7 up to 0.72 rad/s; Polymetis stops at 2.51).
+CONTROL_DT = 0.1
+MAX_LIN_SPEED = 0.12  # m/s
+MAX_LIN_ACC = 0.6  # m/s^2
+MAX_ANG_SPEED = 0.8  # rad/s
+MAX_ANG_ACC = 3.0  # rad/s^2
+# The action is TRACK_GAIN times the reference's lead on the arm, the same gain the stock script puts on position,
+# so presses into contact (tabletop into the corner, leg into the hole) are as firm as before. The arm covers about
+# 40% of the action per step, so it follows the reference closely.
+TRACK_GAIN = 2.0
+# How far the action may lead the arm. This also caps the speed at about 0.1 m/s. 2.5 cm is where process_pickles
+# clips, and the screw aims 15 degrees ahead.
+MAX_LEAD_POS = 0.025
+MAX_LEAD_ROT = math.radians(15)
+# The diff-IK controller (the sim's and Polymetis' alike) moves the joint targets by J^+ times the action each step.
+# Where the wrist is near a limit (joint 6 near 3.75 after the tilted insertion), a small end-effector move can need
+# a large joint move, which the speed limits above don't see, so the whole action is scaled down to keep every joint
+# step under this. A 15 degree turn about the gripper axis is about 0.26 rad of joint 7.
+MAX_JOINT_STEP = 0.3
+# The expert's goal is kept in this box (robot frame, m). Successful demos stay within x 0.36-0.70, y -0.05-0.22 and
+# z 0.01-0.28. A lost grasp otherwise sends the arm after goals computed from a part it no longer holds.
+WORKSPACE_LOW = (0.25, -0.25, -0.02)
+WORKSPACE_HIGH = (0.85, 0.45, 0.35)
 
 SETTLE_STEPS = 2  # Consecutive steps at the target before the gripper may change
 
@@ -58,7 +88,7 @@ APPROACH_ANGLE_TOLERANCE = math.radians(5)
 CLEAR_Z = 0.04
 CLEAR_BAND = 0.03
 NEAR_GOAL_DIST = 0.03  # Within this, sideways motion is always allowed
-APPROACH_TIMEOUT = 70
+APPROACH_TIMEOUT = 100
 GRASP_POS_NOISE = 0.003  # Varies the grasps, like the stock script
 GRASP_YAW_NOISE = math.radians(3)
 
@@ -74,10 +104,10 @@ CARRY_LIFT_START = 0.02  # Above the height it was picked at
 CARRY_LIFT_BAND = 0.04
 CARRY_POS_TOLERANCE = 0.015
 CARRY_ANGLE_TOLERANCE = math.radians(8)
-CARRY_TIMEOUT = 70
+CARRY_TIMEOUT = 100
 ALIGN_HOVER = 0.03
 ALIGN_HOVER_PER_ERROR = 3.0
-ALIGN_TIMEOUT = 60
+ALIGN_TIMEOUT = 80
 LEG_POS_TOLERANCE = 0.003
 INSERT_TIMEOUT = 40
 
@@ -86,9 +116,10 @@ SCREW_START_YAW = math.pi / 2
 SCREW_END_YAW = -math.pi / 2
 YAW_STEP = math.radians(ORI_BOUND_DEG)  # How far ahead of the current yaw to aim, so a turn can't go the short way around
 SCREW_YAW_STEP = math.radians(15)  # Turning the leg any faster doesn't let the thread catch, and it pops back out
-YAW_GAIN = 2.0
+YAW_GAIN = 2.0  # Without smoothing, aim past the goal to make up for the slow controller
+AIM_GAIN = YAW_GAIN  # Set by patch_expert. With smoothing, TRACK_GAIN does this instead, and aims stop at the goal
 YAW_TOLERANCE = math.radians(2)
-ROTATE_TIMEOUT = 90
+ROTATE_TIMEOUT = 120
 # After the insertion the gripper is still tilted around a leg that is only just seated. Swinging upright fast knocks
 # it out of the hole, so straighten up slowly and center on the leg as the tilt goes away, then turn at full speed.
 STRAIGHTEN_ANGLE = math.radians(5)
@@ -103,7 +134,7 @@ PUSH_POS_TOLERANCE = 0.002
 PUSH_YAW_TOLERANCE = math.radians(1.5)
 PUSH_STALL_DIST = 0.0005
 PUSH_STALL_STEPS = 8
-PUSH_TIMEOUT = 60
+PUSH_TIMEOUT = 80
 
 # Return to a centered pose after success
 HOME_POS = (0.5, 0.0, 0.2)  # Over the middle of the workspace, on the fixture's center line
@@ -112,9 +143,113 @@ HOME_LEG_CLEARANCE = 0.065  # Above the height the leg was held at
 HOME_CLEAR_BAND = 0.03
 HOME_POS_TOLERANCE = 0.01
 HOME_ANGLE_TOLERANCE = math.radians(4)
-HOME_TIMEOUT = 80
+HOME_TIMEOUT = 120
 
 MAX_ROTATION_AIM = math.radians(40)
+
+
+class MotionShaper:
+    """A reference pose, moved toward the expert's goal with bounded speed and acceleration.
+
+    The speed is also capped by how far the reference can stop from the goal at the given deceleration, so moves ease
+    in and out without overshooting, and the reference is kept within a lead of the arm, so it doesn't wind up while
+    the arm is held back.
+    """
+
+    def __init__(
+        self,
+        max_lin_speed=MAX_LIN_SPEED,
+        max_lin_acc=MAX_LIN_ACC,
+        max_ang_speed=MAX_ANG_SPEED,
+        max_ang_acc=MAX_ANG_ACC,
+        max_lead_pos=MAX_LEAD_POS / TRACK_GAIN,
+        max_lead_rot=MAX_LEAD_ROT / TRACK_GAIN,
+        dt=CONTROL_DT,
+    ):
+        self.max_lin_speed, self.max_lin_acc = max_lin_speed, max_lin_acc
+        self.max_ang_speed, self.max_ang_acc = max_ang_speed, max_ang_acc
+        self.max_lead_pos, self.max_lead_rot = max_lead_pos, max_lead_rot
+        self.dt = dt
+
+    def reset(self, ee_pos, ee_rot):
+        self.pos, self.rot = ee_pos.copy(), ee_rot
+        self.vel, self.ang_vel = np.zeros(3), np.zeros(3)
+
+    def stopped(self):
+        return np.linalg.norm(self.vel) < 0.005 and np.linalg.norm(self.ang_vel) < 0.05
+
+    def _next_velocity(self, vel, error, max_speed, max_acc):
+        dist = np.linalg.norm(error)
+        # Fastest speed that still stops within dist, slowing down by max_acc * dt each step
+        brake = max_acc * self.dt * (math.sqrt(0.25 + 2 * dist / (max_acc * self.dt**2)) - 0.5)
+        speed = min(max_speed, brake, dist / self.dt)
+        desired = error / dist * speed if dist > 1e-9 else np.zeros(3)
+        change = desired - vel
+        norm = np.linalg.norm(change)
+        if norm > max_acc * self.dt:
+            change *= max_acc * self.dt / norm
+        return vel + change
+
+    def step(self, ee_pos, ee_rot, goal_pos, goal_rot):
+        """Next target pose. Positions are numpy arrays, rotations scipy Rotations, all in the robot frame."""
+        self.vel = self._next_velocity(
+            self.vel, goal_pos - self.pos, self.max_lin_speed, self.max_lin_acc
+        )
+        self.pos = self.pos + self.vel * self.dt
+        self.ang_vel = self._next_velocity(
+            self.ang_vel,
+            (goal_rot * self.rot.inv()).as_rotvec(),
+            self.max_ang_speed,
+            self.max_ang_acc,
+        )
+        self.rot = R.from_rotvec(self.ang_vel * self.dt) * self.rot
+
+        lead = self.pos - ee_pos
+        norm = np.linalg.norm(lead)
+        if norm > self.max_lead_pos:
+            self.pos = ee_pos + lead * self.max_lead_pos / norm
+        lead = (self.rot * ee_rot.inv()).as_rotvec()
+        norm = np.linalg.norm(lead)
+        if norm > self.max_lead_rot:
+            self.rot = R.from_rotvec(lead * self.max_lead_rot / norm) * ee_rot
+        return self.pos, self.rot
+
+
+def _ee_pose_np(env):
+    ee_pos, ee_quat = env.get_ee_pose()
+    return (
+        ee_pos.squeeze().cpu().numpy().astype(np.float64),
+        R.from_quat(ee_quat.squeeze().cpu().numpy().astype(np.float64)),
+    )
+
+
+def shaped_action(shaper, env, goal, gripper):
+    """The (1, 8) delta action toward the shaper's next reference pose.
+
+    goal is the expert's (position, xyzw quaternion) in the robot frame, or None to come to a stop.
+    """
+    ee_pos, ee_rot = _ee_pose_np(env)
+    if goal is None:
+        goal_pos, goal_rot = shaper.pos, shaper.rot
+    else:
+        goal_pos = goal[0].reshape(-1).cpu().numpy().astype(np.float64)
+        goal_rot = R.from_quat(goal[1].reshape(-1).cpu().numpy().astype(np.float64))
+    goal_pos = np.clip(goal_pos, WORKSPACE_LOW, WORKSPACE_HIGH)
+    pos, rot = shaper.step(ee_pos, ee_rot, goal_pos, goal_rot)
+    delta_pos = TRACK_GAIN * (pos - ee_pos)
+    delta_rotvec = TRACK_GAIN * (ee_rot.inv() * rot).as_rotvec()
+
+    # Joint target step the controller will take for this action: rotation error in the world frame, as it uses
+    jacobian = env.jacobian_eef[0].cpu().numpy().astype(np.float64)
+    error = np.concatenate([delta_pos, ee_rot.apply(delta_rotvec)])
+    joint_step = np.abs(np.linalg.lstsq(jacobian, error, rcond=None)[0]).max()
+    shaper.last_joint_step = joint_step
+    if joint_step > MAX_JOINT_STEP:
+        delta_pos *= MAX_JOINT_STEP / joint_step
+        delta_rotvec *= MAX_JOINT_STEP / joint_step
+
+    action = np.concatenate([delta_pos, R.from_rotvec(delta_rotvec).as_quat(), [gripper]])
+    return torch.tensor(action, dtype=torch.float32, device=env.device).unsqueeze(0)
 
 
 def _rot_z(yaw, device):
@@ -136,7 +271,7 @@ def _gripper_down_ori(yaw, device):
 
 def _yaw_toward(ee_yaw, goal_yaw, step=YAW_STEP):
     """Next yaw on the way to goal_yaw. Stays on the side of the circle through 0, so it never wraps."""
-    return ee_yaw + float(np.clip(YAW_GAIN * (goal_yaw - ee_yaw), -step, step))
+    return ee_yaw + float(np.clip(AIM_GAIN * (goal_yaw - ee_yaw), -step, step))
 
 
 def _angle_between(a, b):
@@ -144,13 +279,13 @@ def _angle_between(a, b):
     return math.acos(float(np.clip(cos, -1.0, 1.0)))
 
 
-def _rotate_toward(ee_ori, goal_ori, fraction=1.0, gain=YAW_GAIN, max_aim=MAX_ROTATION_AIM):
+def _rotate_toward(ee_ori, goal_ori, fraction=1.0, max_aim=MAX_ROTATION_AIM):
     """Orientation to aim for to turn fraction of the way to goal_ori, without slowing to a crawl near the end."""
     rotvec = R.from_matrix((ee_ori.T @ goal_ori).cpu().numpy().astype(np.float64)).as_rotvec()
     angle = np.linalg.norm(rotvec)
     if angle < 1e-6:
         return goal_ori
-    aim = min(gain * fraction * angle, max_aim)
+    aim = min(AIM_GAIN * fraction * angle, max_aim)
     rel = R.from_rotvec(rotvec / angle * aim).as_matrix()
     return ee_ori @ torch.tensor(rel, device=ee_ori.device, dtype=torch.float32)
 
@@ -544,11 +679,25 @@ def _table_pre_assemble(
     )
 
 
-def patch_expert(furniture):
-    """Swap in the modified FSMs on one_leg's parts. Other furniture keeps the stock script."""
+def patch_expert(furniture, aim_gain=YAW_GAIN):
+    """Swap in the modified FSMs on one_leg's parts. Other furniture keeps the stock script.
+
+    Each step, the goal pose they return is also left in furniture._v2_goal, for the smoothing.
+    """
+    global AIM_GAIN
+    AIM_GAIN = aim_gain
+
+    def keep_goal(fsm):
+        def step(*args):
+            out = fsm(*args)
+            furniture._v2_goal = (out[0], out[1])
+            return out
+
+        return step
+
     for part in furniture.parts:
         if isinstance(part, SquareTableLeg):
-            part.fsm_step = types.MethodType(_leg_fsm_step, part)
+            part.fsm_step = keep_goal(types.MethodType(_leg_fsm_step, part))
             # The stock script jitters the action during these states, which also shakes the leg as it is let go
             part.state_no_noise = lambda: False
         elif isinstance(part, SquareTableTop):
@@ -556,7 +705,7 @@ def patch_expert(furniture):
             def pre_assemble(self, *args, _original=part.pre_assemble):
                 return _table_pre_assemble(self, _original, *args)
 
-            part.pre_assemble = types.MethodType(pre_assemble, part)
+            part.pre_assemble = keep_goal(types.MethodType(pre_assemble, part))
             # Leaving the tabletop no longer has its own go_up state
             part.skill_complete_next_states = ["push", "done"]
 
@@ -593,6 +742,14 @@ class DataCollector:
         verbose: bool = False,
         max_env_steps: int = None,
         return_home: bool = True,
+        env_type: str = "rl",
+        sample_perturbations: bool = False,
+        keep_april_tags: bool = False,
+        smooth: bool = True,
+        max_lin_speed: float = MAX_LIN_SPEED,
+        max_lin_acc: float = MAX_LIN_ACC,
+        max_ang_speed: float = MAX_ANG_SPEED,
+        max_ang_acc: float = MAX_ANG_ACC,
     ):
         """
         Args:
@@ -616,13 +773,56 @@ class DataCollector:
             save_mp4 (bool): Also save an mp4 of both cameras (wrist | front) next to each pickle.
             max_env_steps (int): Steps allowed to finish the assembly. Defaults to sim_config["scripted_timeout"].
             return_home (bool): After a scripted success, keep recording while the arm returns to a centered pose.
+            env_type (str): "rl" for FurnitureRLSimEnv (teleop, training and evaluation), "sim" for FurnitureSimEnv.
+            sample_perturbations (bool): Push random parts during the episode, like the perturbed evaluation. "rl" only.
+            keep_april_tags (bool): Load the tagged part meshes in the "rl" env. The "sim" env is set by
+                turn_off_april_tags() instead.
+            smooth (bool): Move the scripted target with the speed and acceleration limits below, see MotionShaper.
+            max_lin_speed, max_lin_acc, max_ang_speed, max_ang_acc (float): Those limits, in m/s, m/s^2, rad/s, rad/s^2.
         """
-        if is_sim:
+        assert env_type in ["rl", "sim"], f"Unknown env_type: {env_type}"
+        assert not sample_perturbations or env_type == "rl", "Perturbations need the RL env"
+        self.env_type = env_type
+        self.sample_perturbations = sample_perturbations
+        self.randomness = randomness
+        self.max_env_steps = max_env_steps or (
+            sim_config["scripted_timeout"][furniture] if scripted else 3000
+        )
+
+        if is_sim and env_type == "rl":
+            from furniture_bench.envs.furniture_rl_sim_env import FurnitureRLSimEnv
+            from furniture_bench.envs.furniture_sim_env import FurnitureSimEnv
+            from furniture_bench.envs.observation import FULL_OBS
+
+            assert ctrl_mode == "diffik", "FurnitureRLSimEnv only supports diffik"
+            # Same settings as the teleop collector (data_collector_sm.py), apart from ending the episode at success
+            self.env = FurnitureRLSimEnv(
+                furniture=furniture,
+                obs_keys=FULL_OBS,
+                headless=headless,
+                max_env_steps=self.max_env_steps,
+                num_envs=1,
+                act_rot_repr="quat",
+                action_type="delta",
+                manual_done=False,
+                resize_img=resize_sim_img,
+                np_step_out=False,
+                channel_first=False,
+                randomness=randomness,
+                compute_device_id=compute_device_id,
+                graphics_device_id=graphics_device_id,
+                ctrl_mode=ctrl_mode,
+                april_tags=keep_april_tags,
+            )
+            # The scripted expert is only defined on FurnitureSimEnv, and only reads state the RL env also has
+            self.env.get_assembly_action = types.MethodType(
+                FurnitureSimEnv.get_assembly_action, self.env
+            )
+        elif is_sim:
             self.env = gym.make(
                 "FurnitureSimFull-v0",
                 furniture=furniture,
-                max_env_steps=max_env_steps
-                or (sim_config["scripted_timeout"][furniture] if scripted else 3000),
+                max_env_steps=self.max_env_steps,
                 headless=headless,
                 num_envs=1,  # Only support 1 for now.
                 manual_done=False if scripted else True,
@@ -671,7 +871,12 @@ class DataCollector:
         self.home_phase = None
 
         if scripted and is_sim:
-            patch_expert(self.env.furniture)
+            patch_expert(self.env.furniture, aim_gain=1.0 if smooth else YAW_GAIN)
+        self.shaper = (
+            MotionShaper(max_lin_speed, max_lin_acc, max_ang_speed, max_ang_acc)
+            if scripted and smooth
+            else None
+        )
         self.verbose = verbose
 
         self._reset_collector_buffer()
@@ -682,7 +887,7 @@ class DataCollector:
         The RL env's parts_poses is the parts followed by the fixture, all in the
         AprilTag frame (42-D for one_leg), while FurnitureSimEnv returns only the parts.
         """
-        if not self.is_sim or "parts_poses" not in obs:
+        if not self.is_sim or self.env_type == "rl" or "parts_poses" not in obs:
             return
 
         rb_idx = self.env.part_idxs["obstacle_front"][0]
@@ -697,8 +902,11 @@ class DataCollector:
             [obs["parts_poses"], obstacle_pose.view(1, -1)], dim=-1
         )
 
-    def _home_action(self):
-        """Next action of the return to the centered pose. Sets self.home_phase to None when it is finished."""
+    def _home_goal(self):
+        """Next goal of the return to the centered pose, as ((position, xyzw quaternion) or None to stop, gripper).
+
+        Sets self.home_phase to None when it is finished.
+        """
         ee_pos, ee_quat = self.env.get_ee_pose()
         ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
         device = ee_pos.device
@@ -710,8 +918,10 @@ class DataCollector:
         if self.home_phase == "settle":
             # Success usually lands mid-turn, so stop the arm before opening the gripper
             gripper = 1.0
-            if self.home_steps >= SETTLE_STEPS:
+            stopped = self.shaper is None or self.shaper.stopped()
+            if (self.home_steps >= SETTLE_STEPS and stopped) or self.home_steps >= GRIP_TIMEOUT:
                 self.home_phase, self.home_steps = "release", 0
+            return None, gripper
         elif self.home_phase == "release":
             if self.env.gripper_width() >= OPEN_CLEAR_LEG or self.home_steps >= GRIP_TIMEOUT:
                 self.home_phase, self.home_steps = "move", 0
@@ -731,15 +941,54 @@ class DataCollector:
             self.home_settled = self.home_settled + 1 if at_home else 0
             if self.home_settled >= SETTLE_STEPS or self.home_steps >= HOME_TIMEOUT:
                 self.home_phase = None
+        return (goal_pos, C.mat2quat(goal_ori).to(device)), gripper
 
+    def _home_action(self):
+        """The return's next action without smoothing."""
+        ee_pos, ee_quat = self.env.get_ee_pose()
+        ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+        goal, gripper = self._home_goal()
+        goal_pos, goal_quat = goal if goal is not None else (ee_pos, ee_quat)
         action = torch.cat(
             [
                 (goal_pos - ee_pos) * 2,  # Same gain as get_assembly_action
-                C.quat_mul(C.quat_conjugate(ee_quat), C.mat2quat(goal_ori).to(device)),
-                torch.tensor([gripper], device=device),
+                C.quat_mul(C.quat_conjugate(ee_quat), goal_quat),
+                torch.tensor([gripper], device=ee_pos.device),
             ]
         )
         return action.unsqueeze(0)
+
+    def _scripted_action(self):
+        """Next scripted (1, 8) action and its skill_complete flag, during the assembly or the return to center."""
+        if self.shaper is None:
+            if self.home_phase is not None:
+                action, skill_complete = self._home_action(), 0
+            else:
+                action, skill_complete = self.env.get_assembly_action()
+            action = scale_scripted_action(
+                action.detach().cpu().clone(),
+                pos_bounds_m=POS_BOUND_M,
+                ori_bounds_deg=ORI_BOUND_DEG if self.env.ctrl_mode == "diffik" else 20,
+                device=self.env.device,
+            )
+            return action, skill_complete
+
+        if self.home_phase is not None:
+            goal, gripper = self._home_goal()
+            skill_complete = 0
+        else:
+            # Only the gripper is used from the stock action: the motion comes from the FSM's goal pose.
+            # Steps that don't go through the FSMs (the moment of success) leave no goal, and the arm stops.
+            self.env.furniture._v2_goal = None
+            raw, skill_complete = self.env.get_assembly_action()
+            goal, gripper = self.env.furniture._v2_goal, raw.reshape(-1)[-1].item()
+        return shaped_action(self.shaper, self.env, goal, gripper), skill_complete
+
+    def _assembled(self):
+        if self.is_sim and self.env_type == "rl":
+            # The RL env checks assembly on its own tensors and doesn't update furniture.assembled_set
+            return bool(self.env.already_assembled.all())
+        return self.env.furnitures[0].all_assembled()
 
     def _verbose_print(self, msg):
         if self.verbose:
@@ -759,28 +1008,18 @@ class DataCollector:
                 and done
                 and self.home_phase is None
                 and not self.home_done
-                and self.env.furnitures[0].all_assembled()
+                and self._assembled()
             ):
                 self.home_phase, self.home_steps, self.home_settled = "settle", 0, 0
                 done = False
 
             # Get an action.
             if self.scripted:
-                if self.home_phase is not None:
-                    action, skill_complete = self._home_action(), 0
-                    if self.home_phase is None:
-                        self.home_done = True
-                        done = True
-                else:
-                    action, skill_complete = self.env.get_assembly_action()
-                pos_bounds_m = POS_BOUND_M
-                ori_bounds_deg = ORI_BOUND_DEG if self.env.ctrl_mode == "diffik" else 20
-                action = scale_scripted_action(
-                    action.detach().cpu().clone(),
-                    pos_bounds_m=pos_bounds_m,
-                    ori_bounds_deg=ori_bounds_deg,
-                    device=self.env.device,
-                )
+                homing = self.home_phase is not None
+                action, skill_complete = self._scripted_action()
+                if homing and self.home_phase is None:
+                    self.home_done = True
+                    done = True
                 collect_enum = CollectEnum.DONE_FALSE
             else:
                 action, collect_enum = self.device_interface.get_action()
@@ -818,7 +1057,7 @@ class DataCollector:
                 n_ob["parts_poses"] = next_obs["parts_poses"]
                 self.obs.append(n_ob)
 
-                if done and not self.env.furnitures[0].all_assembled():
+                if done and not self._assembled():
                     if self.save_failure:
                         print("Saving failure trajectory.")
                         collect_enum = CollectEnum.FAIL
@@ -840,7 +1079,15 @@ class DataCollector:
                 continue
 
             # Execute action.
-            next_obs, rew, done, info = self.env.step(action)
+            if self.env_type == "rl":
+                next_obs, rew, done, info = self.env.step(
+                    action, sample_perturbations=self.sample_perturbations
+                )
+                # The RL env has no timeout of its own
+                if self.env.env_steps[0].item() >= self.max_env_steps:
+                    done = torch.ones_like(done)
+            else:
+                next_obs, rew, done, info = self.env.step(action)
             self._append_obstacle_pose(next_obs)
 
             # The env reports done from the moment of success on, which doesn't end the return
@@ -927,7 +1174,21 @@ class DataCollector:
         return self.reset()
 
     def reset(self):
+        if self.is_sim and self.env_type == "sim" and str(self.randomness) == "high":
+            # "high" in FurnitureSimEnv is one of three fixed layouts. Pick one per episode instead of always the first
+            self.env.unwrapped.high_random_idx = int(np.random.randint(3))
         obs = self.env.reset()
+        if self.is_sim and self.env_type == "rl" and self.scripted:
+            # Unlike FurnitureSimEnv, the RL env's reset leaves the expert's state where the last episode ended
+            self.env.furniture.reset()
+            self.env.assemble_idx = 0
+            self.env.move_neutral = False
+        if self.scripted:
+            # Our own per-state step counters, so a stale count can't carry into the next episode
+            for part in self.env.furniture.parts:
+                part._v2_state = None
+        if self.shaper is not None:
+            self.shaper.reset(*_ee_pose_np(self.env))
         self._append_obstacle_pose(obs)
         self._reset_collector_buffer()
         self.home_phase = None
@@ -1000,7 +1261,21 @@ class DataCollector:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--randomness", "-r", type=str, default="low")
+    parser.add_argument(
+        "--randomness", "-r", type=str, default="low", choices=["low", "med", "high"]
+    )
+    parser.add_argument(
+        "--env",
+        type=str,
+        default="rl",
+        choices=["rl", "sim"],
+        help="rl: FurnitureRLSimEnv, as teleop, training and evaluation use. sim: FurnitureSimEnv (data_collector.py)",
+    )
+    parser.add_argument(
+        "--sample-perturbations",
+        action="store_true",
+        help="Push random parts during the episode, like the perturbed evaluation (rl env only). Saves to <randomness>_perturb",
+    )
     parser.add_argument("--num-demos", "-n", type=int, default=100)
     parser.add_argument("--gpu-id", "-g", type=int, default=0)
     parser.add_argument("--furniture", "-f", type=str, required=True)
@@ -1031,7 +1306,20 @@ if __name__ == "__main__":
         action="store_true",
         help="End the episode at success instead of returning to the centered pose",
     )
+    parser.add_argument(
+        "--no-smooth",
+        action="store_true",
+        help="Send the expert's actions as they are, without the speed and acceleration limits",
+    )
+    parser.add_argument("--max-lin-speed", type=float, default=MAX_LIN_SPEED, help="m/s")
+    parser.add_argument("--max-lin-acc", type=float, default=MAX_LIN_ACC, help="m/s^2")
+    parser.add_argument("--max-ang-speed", type=float, default=MAX_ANG_SPEED, help="rad/s")
+    parser.add_argument("--max-ang-acc", type=float, default=MAX_ANG_ACC, help="rad/s^2")
     args = parser.parse_args()
+    if args.sample_perturbations and args.env != "rl":
+        parser.error("--sample-perturbations needs --env rl")
+    if args.env == "rl" and args.ctrl_mode != "diffik":
+        parser.error("--env rl only supports --ctrl-mode diffik")
 
     # Load the tagless part meshes, like the RL env and the rest of the pipeline
     if not args.keep_april_tags:
@@ -1042,7 +1330,8 @@ if __name__ == "__main__":
         domain="sim",
         task=args.furniture,
         demo_source="scripted",
-        randomness=args.randomness,
+        # Same naming as teleop.py
+        randomness=args.randomness + ("_perturb" if args.sample_perturbations else ""),
         suffix=args.suffix,
     )
     print(f"Saving data to directory: {data_path}")
@@ -1067,5 +1356,13 @@ if __name__ == "__main__":
         save_mp4=args.save_mp4,
         max_env_steps=args.max_env_steps,
         return_home=not args.no_return_home,
+        env_type=args.env,
+        sample_perturbations=args.sample_perturbations,
+        keep_april_tags=args.keep_april_tags,
+        smooth=not args.no_smooth,
+        max_lin_speed=args.max_lin_speed,
+        max_lin_acc=args.max_lin_acc,
+        max_ang_speed=args.max_ang_speed,
+        max_ang_acc=args.max_ang_acc,
     )
     collector.collect()
