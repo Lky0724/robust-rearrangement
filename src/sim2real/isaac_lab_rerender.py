@@ -135,15 +135,15 @@ april_to_sim_mat = np.array(
 )
 front_435_camera_matrix = np.array(
     [
-        [607.24603271, 0.0, 328.35696411],
-        [0.0, 607.39056396, 244.84118652],
+        [603.70898438, 0.0, 322.38723755],
+        [0.0, 603.42315674, 249.26660156],
         [0.0, 0.0, 1.0],
     ]
 )
 wrist_435_camera_matrix = np.array(
     [
-        [613.14752197, 0.0, 326.19647217],
-        [0.0, 613.16229248, 244.59855652],
+        [607.46057129, 0.0, 316.16723633],
+        [0.0, 606.96691895, 243.04000854],
         [0.0, 0.0, 1.0],
     ]
 )
@@ -732,10 +732,10 @@ def main():
     # Play the simulator
     sim.reset()
 
-    cam_pos = torch.from_numpy(np.array([0.82, -0.065, 0.8]).reshape(1, 3))
+    cam_pos = torch.from_numpy(np.array([0.83, 0.0, 0.83]).reshape(1, 3))
     cam_quat = torch.from_numpy(
         T.convert_quat(
-            R.from_euler("XYZ", np.deg2rad([0.0, 68.5, 90])).as_quat(), to="wxyz"
+            R.from_euler("XYZ", np.deg2rad([0.0, 54.5, 90.0])).as_quat(), to="wxyz"
         ).reshape(1, 4)
     )
     camera._view.set_world_poses(cam_pos, cam_quat)
