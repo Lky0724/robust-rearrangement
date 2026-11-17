@@ -778,19 +778,25 @@ def main():
     joint_ids = [robot.joint_names.index(n) for n in expected_joints]
     print(f"[robot] {args_cli.robot}: joints {robot.joint_names}, wrist camera on /World/Robot_2/{robot_prefix}_hand")
 
-    cam_pos = torch.from_numpy(np.array([0.83, 0.0, 0.83]).reshape(1, 3))
+    cam_pos = torch.from_numpy(np.array([0.787, 0.0, 0.809]).reshape(1, 3))
     cam_quat = torch.from_numpy(
         T.convert_quat(
-            R.from_euler("XYZ", np.deg2rad([0.0, 64.0, 90.0])).as_quat(), to="wxyz"
+            R.from_euler("XYZ", np.deg2rad([-0.145, 64.17, 90.161])).as_quat(), to="wxyz"
         ).reshape(1, 4)
     )
     camera._view.set_world_poses(cam_pos, cam_quat)
     # camera._sensor_xform.set_world_pose(cam_pos, cam_quat)
 
-    local_wrist_pos = torch.from_numpy(np.array([-0.05, 0.0, 0.04])).reshape(1, 3)
+    # Wrist RGB optical centre in the hand frame (FurnitureBench mount, D435 on its two rear M3 holes, mount
+    # screwed to the hand back on the centre line). y: the camera body centre sits 28.5 mm to the hand's -y
+    # (mount STL: M3-hole midpoint vs counterbored hole) and the RGB lens is 32.5 mm to the camera's left
+    # = hand +y (D400 datasheet: 17.5 mm 1/4-20 centreline -> left imager, +15 mm -> RGB), so +4 mm;
+    # +5 mm after comparing with the real wrist image.
+    local_wrist_pos = torch.from_numpy(np.array([-0.05, 0.005, 0.04])).reshape(1, 3)
     local_wrist_rot = torch.from_numpy(
         T.convert_quat(
-            R.from_euler("XYZ", np.deg2rad([0, 200, -90])).as_quat(),
+            # 180 + 17: view along the fingers, tilted 17 deg toward them (mount nominal is 20 deg)
+            R.from_euler("XYZ", np.deg2rad([0, 197, -90])).as_quat(),
             to="wxyz",
         )
     ).reshape(1, 4)
