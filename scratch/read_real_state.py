@@ -27,8 +27,10 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from src.real.serials import FRONT_CAMERA_SERIAL, WRIST_CAMERA_SERIAL  # noqa: E402
 
-# Reference pose: the arm is large in the front view and the hand is in the middle of the table.
-JOINTS = [0.1477, 0.5077, -0.0040, -2.2292, -0.1083, 2.3425, 0.0431]
+# Reference pose: the arm is large in the front view and the hand is near the image centre.
+# It is the first frame of a one_leg sim rollout with the TCP raised 8 cm (same hand orientation,
+# FR3 IK): TCP at base (0.450, 0.055, 0.101) m, about 10 cm above the parts plane, tilted ~23 deg.
+JOINTS = [0.1449, 0.3155, 0.0023, -2.2580, -0.0963, 2.1797, 0.0263]
 OUT = REPO / "scratch" / "align"
 
 
