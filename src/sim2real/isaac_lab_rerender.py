@@ -279,12 +279,15 @@ def _env_vec(name, default):
 
 # Scene appearance matched to our real cell (black foam yoga mat on the table, dark blue-teal fabric
 # around it). Colours are linear albedo; each can be overridden per run with an environment variable.
-SCENE_TABLE_WIDTH = float(os.getenv("SCENE_TABLE_WIDTH", 0.98))  # m along y (asset: 0.8 x 1.35 = 1.08)
+SCENE_TABLE_WIDTH = float(os.getenv("SCENE_TABLE_WIDTH", 0.78))  # m along y (asset: 0.8 x 1.35 = 1.08)
 SCENE_TABLE_BACK_CUT = float(os.getenv("SCENE_TABLE_BACK_CUT", 0.53))  # m removed from the far (-x) end
-SCENE_TABLE_COLOR = _env_vec("SCENE_TABLE_COLOR", (0.055, 0.065, 0.058))
+SCENE_TABLE_COLOR = _env_vec("SCENE_TABLE_COLOR", (0.036, 0.042, 0.038))
 SCENE_TABLE_ROUGHNESS = float(os.getenv("SCENE_TABLE_ROUGHNESS", 0.9))
-SCENE_BG_COLOR = _env_vec("SCENE_BG_COLOR", (0.025, 0.07, 0.105))
+SCENE_BG_COLOR = _env_vec("SCENE_BG_COLOR", (0.0065, 0.026, 0.043))
 SCENE_BG_ROUGHNESS = float(os.getenv("SCENE_BG_ROUGHNESS", 1.0))
+# One flat fabric panel behind the robot instead of background.usda's three-part folding screen.
+BACK_PANEL_X = float(os.getenv("BACK_PANEL_X", -0.8))  # world x of the panel (old back wall; base x -0.5)
+BACK_PANEL_SIZE = _env_vec("BACK_PANEL_SIZE", (3.0, 2.0))  # width along y, height from the floor (m)
 ROBOT_WHITE = float(os.getenv("ROBOT_WHITE", 0.55))  # albedo of the FR3's white covers and the hand's white plastic
 ROBOT_WHITE_ROUGHNESS = float(os.getenv("ROBOT_WHITE_ROUGHNESS", 0.3))
 
@@ -313,12 +316,17 @@ def apply_scene_appearance():
     mat_cfg.func(fabric, mat_cfg)
     walls = [c for root in ("/World/Background", "/World/Table/room")
              for c in Usd.PrimRange(stage.GetPrimAtPath(root)) if c.IsA(UsdGeom.Mesh)]
+    UsdGeom.Imageable(stage.GetPrimAtPath("/World/Background")).MakeInvisible()
+    panel = UsdGeom.Cube.Define(stage, "/World/BackPanel")  # unit cube spans -1..1, so scale = half extents
+    panel.AddTranslateOp().Set(Gf.Vec3d(BACK_PANEL_X, 0.0, BACK_PANEL_SIZE[1] / 2))
+    panel.AddScaleOp().Set(Gf.Vec3f(0.005, BACK_PANEL_SIZE[0] / 2, BACK_PANEL_SIZE[1] / 2))
+    walls = [w for w in walls if not str(w.GetPath()).startswith("/World/Background")] + [panel.GetPrim()]
     for w in walls:
         UsdShade.MaterialBindingAPI.Apply(w).Bind(
             UsdShade.Material(stage.GetPrimAtPath(fabric)), UsdShade.Tokens.strongerThanDescendants
         )
     print(f"[scene] table {length:.3f} x {SCENE_TABLE_WIDTH:.3f} m (back cut {SCENE_TABLE_BACK_CUT} m) colour {SCENE_TABLE_COLOR}, "
-          f"fabric {SCENE_BG_COLOR} on {len(walls)} wall meshes")
+          f"fabric {SCENE_BG_COLOR} on {len(walls)} wall meshes, back panel {BACK_PANEL_SIZE} m at x={BACK_PANEL_X}")
 
 
 def split_link6_pad(stage, mesh_path, white, pad_min_y=0.05):
