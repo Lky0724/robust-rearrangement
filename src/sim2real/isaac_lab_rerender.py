@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from scipy.spatial.transform import Rotation as R
 
+# Import numba (used by furniture_bench.utils.transform) before Isaac Sim starts: Isaac's bundled
+# pip_prebundle ships an old `coverage` that shadows the env's one and breaks numba's import.
+import numba  # noqa: F401
+
 # import isaacsim
 # from omni.isaac.kit import SimulationApp
 from omni.isaac.lab.app import AppLauncher
@@ -644,6 +648,17 @@ def main():
         usd_path=str((usd_base_path / "background.usda")),
     )
 
+    # Fixture geometry, overridable per run with environment variables so it can match the real
+    # printed fixture. Defaults: side-bar inner faces 35 cm apart (measured on our real fixture;
+    # the FurnitureBench sim uses 33 cm), front bar 35 x 2 x 3 cm, side bars 17 x 2 x 3 cm.
+    obst_side_y = float(os.getenv("OBST_SIDE_Y", 0.185))  # side-bar centre |y| from front-bar centre (sim: 0.175)
+    obst_side_dx = float(os.getenv("OBST_SIDE_DX", 0.075))  # side-bar centre behind front-bar centre (sim: 0.075)
+    obst_front_len = float(os.getenv("OBST_FRONT_LEN", 0.35))  # front-bar length in m (mesh is 0.35)
+    print(
+        f"[fixture] side |y|={obst_side_y:.3f} m (inner gap {2 * obst_side_y - 0.02:.3f} m), "
+        f"side dx={obst_side_dx:.3f} m, front length={obst_front_len:.3f} m"
+    )
+
     # Obstacle front.
     obs_quat_wxyz = np.array([0.7071067690849304, 0, 0, 0.7071067690849304])
     prim_utils.create_prim(
@@ -669,6 +684,8 @@ def main():
     obstacle_center_view = XFormPrimView(
         "/World/ObstacleFront", reset_xform_properties=False
     )
+    # The front-bar mesh is long along its local x (extent +-0.175 m), so stretch only that axis.
+    obstacle_center_view.set_local_scales(torch.Tensor([[obst_front_len / 0.35, 1.0, 1.0]]))
     obstacle_right_view = XFormPrimView(
         "/World/ObstacleRight", reset_xform_properties=False
     )
@@ -735,7 +752,7 @@ def main():
     cam_pos = torch.from_numpy(np.array([0.83, 0.0, 0.83]).reshape(1, 3))
     cam_quat = torch.from_numpy(
         T.convert_quat(
-            R.from_euler("XYZ", np.deg2rad([0.0, 54.5, 90.0])).as_quat(), to="wxyz"
+            R.from_euler("XYZ", np.deg2rad([0.0, 64.0, 90.0])).as_quat(), to="wxyz"
         ).reshape(1, 4)
     )
     camera._view.set_world_poses(cam_pos, cam_quat)
@@ -863,11 +880,11 @@ def main():
         obs_pose_ori = T.convert_quat(obs_pose_ori, to="wxyz")
 
         if obs_name == "right":
-            obs_pose_pos[0] -= 0.075
-            obs_pose_pos[1] -= 0.175
+            obs_pose_pos[0] -= obst_side_dx
+            obs_pose_pos[1] -= obst_side_y
         elif obs_name == "left":
-            obs_pose_pos[0] -= 0.075
-            obs_pose_pos[1] += 0.175
+            obs_pose_pos[0] -= obst_side_dx
+            obs_pose_pos[1] += obst_side_y
 
         obs_pose_pos = torch.from_numpy(obs_pose_pos).unsqueeze(0)
         obs_pose_ori = torch.from_numpy(obs_pose_ori).unsqueeze(0)
