@@ -1073,7 +1073,9 @@ def main():
         assert args_cli.save_dir is not None, f"Must set --save-dir if --save is True!"
         demo_save_dir = Path(args_cli.save_dir)
         demo_save_dir.mkdir(exist_ok=True, parents=True)
-        pkl_path = demo_save_dir / f"{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}.pkl"
+        # Keep the source episode's name (minus .xz: the output is written uncompressed) so batch loops can
+        # skip episodes that are already rendered.
+        pkl_path = demo_save_dir / Path(FILE).name.removesuffix(".xz")
 
     episode_data = {}
     episode_data["observations"] = []
@@ -1315,8 +1317,10 @@ def main():
             # print(f"front_image shape: {front_image.shape}")
 
             # log the new observation
-            wrist_image = wrist_camera.data.output["rgb"][0, :, :, :3].cpu().numpy()
-            front_image2 = camera.data.output["rgb"][0, :, :, :3].cpu().numpy()
+            # .copy(): on a CPU sim .cpu().numpy() is a view of the camera buffer, so without it every
+            # saved frame would end up showing the last rendered image.
+            wrist_image = wrist_camera.data.output["rgb"][0, :, :, :3].cpu().numpy().copy()
+            front_image2 = camera.data.output["rgb"][0, :, :, :3].cpu().numpy().copy()
 
             # print(f"front_image shape: {front_image.shape}")
 
