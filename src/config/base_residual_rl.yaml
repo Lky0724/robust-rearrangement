@@ -34,6 +34,15 @@ env:
   task: one_leg
   stiffness: 1000.0  # Arm joint PD stiffness (Nm/rad) of the diff-IK position drive; paper setting 1000
   damping: 200.0  # Arm joint PD damping; paper setting 200
+  # Where training episodes start (src/eval/start_states.py), for a base policy trained on a
+  # segment of the task:
+  #   inherit  - the base BC checkpoint's rollout.reset_from; for checkpoints without it (or with
+  #              null) this is the env's own reset, i.e. the original setup
+  #   null     - the env's own reset (original setup), whatever the checkpoint says
+  #   <path>   - a .npz from scripts/gen_start_states.py, or a folder of raw pickles
+  reset_from: inherit
+  # Where eval episodes start: same (as reset_from), null (the env's own reset) or <path>
+  eval_reset_from: same
 
 actor:
   residual_policy:

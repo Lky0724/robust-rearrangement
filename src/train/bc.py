@@ -26,6 +26,7 @@ from src.dataset.dataloader import FixedStepsDataloader
 from src.dataset.dataset import ImageDataset, StateDataset
 from src.eval.eval_utils import get_model_from_api_or_cached
 from src.eval.rollout import do_rollout_evaluation
+from src.eval.start_states import StartStates, load_start_states
 from src.gym import get_rl_env
 from src.models.ema import SwitchEMA
 
@@ -104,6 +105,7 @@ def main(cfg: DictConfig):
 
     print(OmegaConf.to_yaml(cfg))
     env: Optional[Env] = None
+    start_states: Optional[StartStates] = None
     device = torch.device(
         f"cuda:{cfg.training.gpu_id}" if torch.cuda.is_available() else "cpu"
     )
@@ -564,6 +566,13 @@ def main(cfg: DictConfig):
                         verbose=True,
                     )
 
+                    # Optionally start the rollouts from recorded states instead of the env's reset
+                    reset_from = OmegaConf.select(cfg, "rollout.reset_from", default=None)
+                    if reset_from is not None:
+                        reset_from = hydra.utils.to_absolute_path(reset_from)
+                        start_states = load_start_states(reset_from, device=env.device)
+                        print(f"Rollouts start from {len(start_states)} states in {reset_from}")
+
                 best_success_rate = do_rollout_evaluation(
                     config=cfg,
                     env=env,
@@ -572,6 +581,7 @@ def main(cfg: DictConfig):
                     actor=actor,
                     best_success_rate=best_success_rate,
                     epoch_idx=epoch_idx,
+                    start_states=start_states,
                 )
 
             # Only the best success rate checkpoint is uploaded to wandb, the others stay local

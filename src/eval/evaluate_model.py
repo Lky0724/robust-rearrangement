@@ -9,6 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 from src.behavior.base import Actor  # noqa
 from src.behavior.diffusion import DiffusionPolicy  # noqa
 from src.eval.rollout import calculate_success_rate
+from src.eval.start_states import StartStates, load_start_states
 from src.behavior import get_actor
 from src.common.tasks import task2idx, task_timeout
 from src.common.files import trajectory_save_dir
@@ -258,6 +259,14 @@ if __name__ == "__main__":
     parser.add_argument("--record-for-coverage", action="store_true")
 
     parser.add_argument("--save-rollouts-suffix", type=str, default="")
+    parser.add_argument(
+        "--reset-from",
+        type=str,
+        default=None,
+        help="A .npz from scripts/gen_start_states.py, or a folder of raw pickles (their first "
+        "observations). Each episode starts from one of these states instead of the env's reset, "
+        "e.g. to evaluate a policy trained on a segment cut by segment_demos.py",
+    )
 
     # Parse the arguments
     args = parser.parse_args()
@@ -281,6 +290,11 @@ if __name__ == "__main__":
         f"Creating the environment with action_type {args.action_type} (this needs to be changed to enable recreation the env for each run)"
     )
     env: Optional[Env] = None
+
+    start_states: Optional[StartStates] = None
+    if args.reset_from is not None:
+        start_states = load_start_states(args.reset_from, device=device)
+        print(f"Starting episodes from {len(start_states)} states in {args.reset_from}")
 
     f: str = args.task
 
@@ -479,6 +493,7 @@ if __name__ == "__main__":
                     break_on_n_success=args.break_on_n_success,
                     stop_after_n_success=args.stop_after_n_success,
                     record_first_state_only=args.record_for_coverage,
+                    start_states=start_states,
                 )
 
                 if args.store_video_wandb:

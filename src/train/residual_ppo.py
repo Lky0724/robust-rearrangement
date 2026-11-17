@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional, Tuple
 
 from ipdb import set_trace as bp
 
@@ -19,6 +20,7 @@ from diffusers.optimization import get_scheduler
 
 from src.gym.env_rl_wrapper import RLPolicyEnvWrapper
 from src.common.config_util import merge_base_bc_config_with_root_config
+from src.eval.start_states import StartStates, load_start_states
 from src.gym.observation import DEFAULT_STATE_OBS
 
 import numpy as np
@@ -65,6 +67,45 @@ def calculate_advantage(
         )
     returns = advantages + values
     return advantages, returns
+
+
+def resolve_start_states(
+    cfg: DictConfig, device
+) -> Tuple[Optional[StartStates], Optional[StartStates]]:
+    """Start states for training and eval episodes, from env.reset_from / env.eval_reset_from.
+    None means the env's own reset (the original setup). Records the paths used in cfg.env."""
+    reset_from = cfg.env.get("reset_from", "inherit")
+    source = "env.reset_from"
+    if reset_from == "inherit":
+        # Whatever the base policy's in-training rollouts started from (null if not set)
+        reset_from = OmegaConf.select(cfg, "base_policy.rollout.reset_from", default=None)
+        source = "base_policy.rollout.reset_from (the BC checkpoint's setting)"
+    eval_reset_from = cfg.env.get("eval_reset_from", "same")
+
+    loaded = {}
+
+    def load(path):
+        if path is None:
+            return None, None
+        path = hydra.utils.to_absolute_path(str(path))
+        if path not in loaded:
+            loaded[path] = load_start_states(path, device=device)
+        return loaded[path], path
+
+    train_states, train_path = load(reset_from)
+    if eval_reset_from == "same":
+        eval_states, eval_path = train_states, train_path
+    else:
+        eval_states, eval_path = load(eval_reset_from)
+
+    def describe(states, path):
+        return "the env's own reset" if states is None else f"{len(states)} start states in {path}"
+
+    print(f"Training episodes start from {describe(train_states, train_path)} (via {source})")
+    print(f"Eval episodes start from {describe(eval_states, eval_path)}")
+    cfg.env.reset_from_used = train_path
+    cfg.env.eval_reset_from_used = eval_path
+    return train_states, eval_states
 
 
 @hydra.main(
@@ -238,6 +279,9 @@ def main(cfg: DictConfig):
         device=device,
     )
 
+    # Start states for segment policies (see src/eval/start_states.py); None = the env's reset
+    train_start_states, eval_start_states = resolve_start_states(cfg, device)
+
     optimizer_actor = optim.AdamW(
         agent.actor_parameters,
         lr=cfg.learning_rate_actor,
@@ -386,7 +430,7 @@ def main(cfg: DictConfig):
     start_time = time.time()
 
     next_done = torch.zeros(cfg.num_envs)
-    next_obs = env.reset()
+    next_obs = env.reset(start_states=train_start_states)
     agent.reset()
 
     # Create model save dir
@@ -404,7 +448,9 @@ def main(cfg: DictConfig):
 
         # Also reset the env to have more consistent results
         if eval_mode or cfg.reset_every_iteration:
-            next_obs = env.reset()
+            next_obs = env.reset(
+                start_states=eval_start_states if eval_mode else train_start_states
+            )
             agent.reset()
 
         print(f"Eval mode: {eval_mode}")

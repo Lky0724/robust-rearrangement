@@ -334,9 +334,21 @@ class RLPolicyEnvWrapper:
         # Define the maximum number of steps in the environment
         self.max_env_steps = max_env_steps
         self.num_envs = self.env.num_envs
+        # Where each set of start states passed to reset() continues from
+        self._start_offsets = {}
 
-    def reset(self, **kwargs):
-        obs = self.env.reset()
+    def reset(self, start_states=None, **kwargs):
+        """Reset all envs. With start_states (src.eval.start_states.StartStates), each env starts
+        from one of them instead of the env's own reset; successive resets go through them in turn."""
+        if start_states is None:
+            obs = self.env.reset()
+        else:
+            # Imported here, as it imports isaacgym, which must come before torch
+            from src.eval.start_states import reset_to_start_states
+
+            offset = self._start_offsets.get(id(start_states), 0)
+            obs = reset_to_start_states(self.env, start_states, offset=offset)
+            self._start_offsets[id(start_states)] = offset + self.num_envs
         self.env_success = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )

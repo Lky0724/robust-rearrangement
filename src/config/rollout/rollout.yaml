@@ -10,3 +10,8 @@ randomness: ${randomness}
 task: ${task}
 n_parts_assemble: null
 parts_poses_in_robot_frame: ${parts_poses_in_robot_frame}
+# null = start from the env's own reset (original setup). Set it to start each rollout from
+# recorded states instead, e.g. for a policy trained on segments cut by segment_demos.py:
+# a .npz from scripts/gen_start_states.py, or a folder of raw pickles (their first
+# observations). See src/eval/start_states.py. Residual PPO inherits it by default (env.reset_from)
+reset_from: null

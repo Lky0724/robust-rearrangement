@@ -19,6 +19,7 @@ from src.common.files import get_processed_path, trajectory_save_dir
 from src.data_collection.io import save_raw_rollout
 from src.data_processing.utils import filter_and_concat_robot_state
 from src.data_processing.utils import resize, resize_crop
+from src.eval.start_states import StartStates, reset_to_start_states
 from tensordict import TensorDict
 
 from copy import deepcopy
@@ -147,10 +148,16 @@ def rollout(
     resize_video: bool = True,
     n_parts_assemble: int = 1,
     save_rollouts: bool = False,
+    start_states: Optional[StartStates] = None,
+    start_offset: int = 0,
 ) -> Optional[RolloutSaveValues]:
     # get first observation
     with suppress_all_output(False):
-        obs = env.reset()
+        if start_states is None:
+            obs = env.reset()
+        else:
+            # Start from recorded states, e.g. the first step of segmented demos
+            obs = reset_to_start_states(env, start_states, offset=start_offset)
         actor.reset()
 
     video_obs = deepcopy(obs)
@@ -257,6 +264,7 @@ def calculate_success_rate(
     break_on_n_success: bool = False,
     stop_after_n_success: int = 0,
     record_first_state_only: bool = False,
+    start_states: Optional[StartStates] = None,
 ) -> RolloutStats:
 
     pbar = SuccessTqdm(
@@ -302,6 +310,8 @@ def calculate_success_rate(
             resize_video=resize_video,
             n_parts_assemble=n_parts_assemble,
             save_rollouts=save_rollouts,
+            start_states=start_states,
+            start_offset=i * env.num_envs,
         )
 
         # Calculate the success rate
@@ -471,6 +481,7 @@ def do_rollout_evaluation(
     actor: Actor,
     best_success_rate: float,
     epoch_idx: int,
+    start_states: Optional[StartStates] = None,
 ) -> float:
     rollout_save_dir = None
 
@@ -497,6 +508,7 @@ def do_rollout_evaluation(
         rollout_save_dir=rollout_save_dir,
         save_rollouts_to_wandb=save_rollouts_to_wandb,
         save_failures=config.rollout.save_failures,
+        start_states=start_states,
     )
     success_rate = rollout_stats.success_rate
     best_success_rate = max(best_success_rate, success_rate)
