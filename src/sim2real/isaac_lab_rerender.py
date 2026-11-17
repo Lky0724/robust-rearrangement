@@ -40,7 +40,15 @@ parser.add_argument("--save", action="store_true")
 parser.add_argument("--save-dir", type=str, default=None)
 parser.add_argument("--num-parts", type=int, required=True)
 parser.add_argument("--furniture", type=str, required=True)
+parser.add_argument(
+    "--robot", choices=["fr3", "panda"], default="fr3",
+    help="arm model to render: fr3 (Isaac Sim asset Robots/Franka/FR3/fr3.usd) or Isaac Lab's panda",
+)
 parser.add_argument("--render-viewer", action="store_true")
+parser.add_argument(
+    "--robot-mask", action="store_true",
+    help="also save robot_mask_front (bool HxW): front-camera pixels that change when the arm is hidden",
+)
 parser.add_argument("-fw", "--flipped-wrist-camera", action="store_true")
 parser.add_argument("-dr", "--domain-rand", action="store_true")
 
@@ -87,7 +95,7 @@ simulation_app = app_launcher.app
 import numpy as np
 import torch
 from torchvision.transforms import functional as F, InterpolationMode
-from pxr import Gf
+from pxr import Gf, UsdGeom
 import omni.isaac.core.utils.prims as prim_utils
 from omni.isaac.core.prims import RigidPrimView, XFormPrimView
 from omni.isaac.core.simulation_context import SimulationContext
@@ -103,6 +111,7 @@ import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.sensors.camera import Camera, CameraCfg
 from omni.isaac.lab.utils import convert_dict_to_backend
 from omni.isaac.lab_assets import FRANKA_PANDA_CFG
+from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR
 from omni.isaac.lab.assets import Articulation
 
 import furniture_bench.utils.transform as T
@@ -716,6 +725,18 @@ def main():
     )
     pos, ori = T.mat2pose(franka_from_origin_mat)
     robot_cfg = FRANKA_PANDA_CFG.replace(prim_path="/World/Robot_2")
+    if args_cli.robot == "fr3":
+        # Same kinematics as the Panda; Isaac Sim's FR3 asset names joints/links fr3_* instead of panda_*,
+        # and fr3_hand sits on fr3_link8 rotated -45 deg about z with no offset, exactly like panda_hand.
+        robot_cfg.spawn = robot_cfg.spawn.replace(usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/Franka/FR3/fr3.usd")
+        robot_cfg.init_state = robot_cfg.init_state.replace(
+            joint_pos={k.replace("panda_", "fr3_"): v for k, v in robot_cfg.init_state.joint_pos.items()}
+        )
+        robot_cfg.actuators = {
+            k: v.replace(joint_names_expr=[e.replace("panda_", "fr3_") for e in v.joint_names_expr])
+            for k, v in robot_cfg.actuators.items()
+        }
+    robot_prefix = "fr3" if args_cli.robot == "fr3" else "panda"
     robot_cfg.init_state.pos = pos
     robot = Articulation(cfg=robot_cfg)
 
@@ -725,7 +746,7 @@ def main():
         width=640,
         # width=1440,
         # height=1080,
-        prim_path="/World/Robot_2/panda_hand/camera",
+        prim_path=f"/World/Robot_2/{robot_prefix}_hand/camera",
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=cam_params["wrist"]["focal_length"],
@@ -748,6 +769,14 @@ def main():
 
     # Play the simulator
     sim.reset()
+
+    # The pickles store 7 arm joints followed by finger 1 and finger 2; write them by name, not by index.
+    expected_joints = [f"{robot_prefix}_joint{i}" for i in range(1, 8)] + [
+        f"{robot_prefix}_finger_joint1",
+        f"{robot_prefix}_finger_joint2",
+    ]
+    joint_ids = [robot.joint_names.index(n) for n in expected_joints]
+    print(f"[robot] {args_cli.robot}: joints {robot.joint_names}, wrist camera on /World/Robot_2/{robot_prefix}_hand")
 
     cam_pos = torch.from_numpy(np.array([0.83, 0.0, 0.83]).reshape(1, 3))
     cam_quat = torch.from_numpy(
@@ -852,6 +881,7 @@ def main():
                 torch.zeros((1,)),
             ]
         ),
+        joint_ids=joint_ids,
     )
 
     # initialize parts
@@ -1087,6 +1117,7 @@ def main():
                         torch.zeros((1,)),
                     ]
                 ),
+                joint_ids=joint_ids,
             )
 
             for j in range(args_cli.num_parts):
@@ -1154,6 +1185,29 @@ def main():
                 color_image3=front_image2,
                 robot_state=obs["robot_state"],
             )
+            if args_cli.robot_mask:
+                # On a CPU sim, .cpu().numpy() aliases the camera buffer; copy before re-rendering.
+                front_image2 = front_image2.copy()
+                wrist_image = wrist_image.copy()
+                new_obs["color_image1"], new_obs["color_image3"] = wrist_image, front_image2
+                # Render the same frame once more with the arm hidden; pixels that change are the robot
+                # (and its shadow). Then show the arm again so the next frames are unaffected.
+                robot_root = prim_utils.get_prim_at_path("/World/Robot_2")
+                robot_links = [UsdGeom.Imageable(c) for c in robot_root.GetChildren() if c.IsA(UsdGeom.Xformable)]
+                for lk in robot_links:
+                    lk.MakeInvisible()
+                sim.step()  # camera buffers only refresh after a physics step (0.1 ms here, negligible)
+                for _ in range(max(args_cli.sub_steps, 1) + 2):
+                    sim.render()
+                camera.update(dt=0.0)
+                no_robot = camera.data.output["rgb"][0, :, :, :3].cpu().numpy().copy()
+                for lk in robot_links:
+                    lk.MakeVisible()
+                sim.step()  # camera buffers only refresh after a physics step (0.1 ms here, negligible)
+                for _ in range(max(args_cli.sub_steps, 1) + 2):
+                    sim.render()
+                diff = np.abs(front_image2.astype(np.int16) - no_robot.astype(np.int16)).max(-1)
+                new_obs["robot_mask_front"] = diff > 12
             episode_data["observations"].append(new_obs)
 
     e = time.time()
