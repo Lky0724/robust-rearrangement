@@ -95,7 +95,7 @@ simulation_app = app_launcher.app
 import numpy as np
 import torch
 from torchvision.transforms import functional as F, InterpolationMode
-from pxr import Gf, UsdGeom
+from pxr import Gf, UsdGeom, UsdShade, Vt
 import omni.isaac.core.utils.prims as prim_utils
 from omni.isaac.core.prims import RigidPrimView, XFormPrimView
 from omni.isaac.core.simulation_context import SimulationContext
@@ -111,7 +111,8 @@ import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.sensors.camera import Camera, CameraCfg
 from omni.isaac.lab.utils import convert_dict_to_backend
 from omni.isaac.lab_assets import FRANKA_PANDA_CFG
-from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR
+from omni.isaac.lab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+from pxr import Usd
 from omni.isaac.lab.assets import Articulation
 
 import furniture_bench.utils.transform as T
@@ -269,6 +270,129 @@ part_mat_paths = [
 table_mat_paths = [
     "/World/Table/Looks/Material_010",
 ]
+
+
+def _env_vec(name, default):
+    v = os.getenv(name)
+    return tuple(float(x) for x in v.split(",")) if v else default
+
+
+# Scene appearance matched to our real cell (black foam yoga mat on the table, dark blue-teal fabric
+# around it). Colours are linear albedo; each can be overridden per run with an environment variable.
+SCENE_TABLE_WIDTH = float(os.getenv("SCENE_TABLE_WIDTH", 0.98))  # m along y (asset: 0.8 x 1.35 = 1.08)
+SCENE_TABLE_BACK_CUT = float(os.getenv("SCENE_TABLE_BACK_CUT", 0.53))  # m removed from the far (-x) end
+SCENE_TABLE_COLOR = _env_vec("SCENE_TABLE_COLOR", (0.055, 0.065, 0.058))
+SCENE_TABLE_ROUGHNESS = float(os.getenv("SCENE_TABLE_ROUGHNESS", 0.9))
+SCENE_BG_COLOR = _env_vec("SCENE_BG_COLOR", (0.025, 0.07, 0.105))
+SCENE_BG_ROUGHNESS = float(os.getenv("SCENE_BG_ROUGHNESS", 1.0))
+ROBOT_WHITE = float(os.getenv("ROBOT_WHITE", 0.55))  # albedo of the FR3's white covers and the hand's white plastic
+ROBOT_WHITE_ROUGHNESS = float(os.getenv("ROBOT_WHITE_ROUGHNESS", 0.3))
+
+
+def apply_scene_appearance():
+    """Narrow the table top, make it a matte black mat, and give the walls a dark fabric material.
+
+    The background walls bind Material_002/003/004, which background.usda never defines (so they
+    rendered default grey), and the room walls in table_room.usda have no material at all.
+    """
+    stage = prim_utils.get_current_stage()
+    top = stage.GetPrimAtPath("/World/Table/table2")
+    # The asset top is 1.3 x 0.8 m and /World/Table is scaled (1.7, 1.35, 1): 2.21 m long, x = -1.105..1.105
+    # in the world. Cut SCENE_TABLE_BACK_CUT off the far end and keep the front edge where it is.
+    length = 2.21 - SCENE_TABLE_BACK_CUT
+    top.GetAttribute("xformOp:scale").Set(Gf.Vec3f(length / 2.21, SCENE_TABLE_WIDTH / 1.08, 1.0))
+    top.GetAttribute("xformOp:translate").Set(Gf.Vec3d(SCENE_TABLE_BACK_CUT / 2 / 1.7, 0.0, 0.4))
+
+    shader = prim_utils.get_prim_at_path(table_mat_paths[0]).GetChildren()[0]
+    shader.GetAttribute("inputs:diffuse_color_constant").Set(Gf.Vec3f(*SCENE_TABLE_COLOR))
+    shader.GetAttribute("inputs:diffuse_tint").Set(Gf.Vec3f(1.0, 1.0, 1.0))
+    shader.GetAttribute("inputs:reflection_roughness_constant").Set(SCENE_TABLE_ROUGHNESS)
+
+    fabric = "/World/Looks/BackgroundFabric"
+    mat_cfg = sim_utils.PreviewSurfaceCfg(diffuse_color=SCENE_BG_COLOR, roughness=SCENE_BG_ROUGHNESS, metallic=0.0)
+    mat_cfg.func(fabric, mat_cfg)
+    walls = [c for root in ("/World/Background", "/World/Table/room")
+             for c in Usd.PrimRange(stage.GetPrimAtPath(root)) if c.IsA(UsdGeom.Mesh)]
+    for w in walls:
+        UsdShade.MaterialBindingAPI.Apply(w).Bind(
+            UsdShade.Material(stage.GetPrimAtPath(fabric)), UsdShade.Tokens.strongerThanDescendants
+        )
+    print(f"[scene] table {length:.3f} x {SCENE_TABLE_WIDTH:.3f} m (back cut {SCENE_TABLE_BACK_CUT} m) colour {SCENE_TABLE_COLOR}, "
+          f"fabric {SCENE_BG_COLOR} on {len(walls)} wall meshes")
+
+
+def split_link6_pad(stage, mesh_path, white, pad_min_y=0.05):
+    """link6's color_64_64_64 subset holds both the pilot pad (dark on the real arm, at y > 5 cm in the
+    link frame) and the joint band around the axis (white on the real arm). Keep the pad dark in its own
+    subset and turn the rest white."""
+    mesh = UsdGeom.Mesh(stage.GetPrimAtPath(mesh_path))
+    dark = [c for c in mesh.GetPrim().GetChildren() if c.GetTypeName() == "GeomSubset"
+            and "color_64_64_64" in (UsdShade.MaterialBindingAPI(c).ComputeBoundMaterial()[0].GetPath().name or "")]
+    if not dark:
+        return 0
+    dark = dark[0]; dark_mat = UsdShade.MaterialBindingAPI(dark).ComputeBoundMaterial()[0]
+    M = np.array(UsdGeom.Xformable(mesh).GetLocalTransformation()).T  # visuals -> link frame
+    pts = np.array(mesh.GetPointsAttr().Get(), float); pts = (np.c_[pts, np.ones(len(pts))] @ M.T)[:, :3]
+    cnt = np.array(mesh.GetFaceVertexCountsAttr().Get()); idx = np.array(mesh.GetFaceVertexIndicesAttr().Get())
+    off = np.r_[0, np.cumsum(cnt)]
+    faces = np.array(dark.GetAttribute("indices").Get())
+    cy = np.array([pts[idx[off[f]:off[f + 1]], 1].mean() for f in faces])
+    pad, band = faces[cy > pad_min_y], faces[cy <= pad_min_y]
+    dark.GetAttribute("indices").Set(Vt.IntArray(band.tolist()))
+    UsdShade.MaterialBindingAPI(dark).Bind(white)
+    pad_subset = UsdGeom.Subset.CreateGeomSubset(
+        mesh, "pilot_pad_dark", UsdGeom.Tokens.face, Vt.IntArray(pad.tolist()), familyName="materialBind"
+    )
+    UsdShade.MaterialBindingAPI.Apply(pad_subset.GetPrim()).Bind(dark_mat)
+    return 1
+
+
+def apply_fr3_appearance(root="/World/Robot_2"):
+    """Make Isaac's FR3 asset look like our arm: one matte white (ROBOT_WHITE) on the covers, including
+    the ones the CAD colours dark grey (color_64_64_64) on links 1-5 and link6's joint band, brushed
+    aluminium where the CAD says 192,192,192 (flange ring), dark kept where the real arm is dark (link0
+    logo ring and base parts, link6 pilot pad, link7 button and side oval), and the Franka Hand look (Isaac Lab's Panda
+    hand and fingers, same frames as fr3_hand / fr3_*finger) instead of the asset's own hand."""
+    stage = prim_utils.get_current_stage()
+    white_path = "/World/Looks/RobotWhite"
+    white_cfg = sim_utils.PreviewSurfaceCfg(
+        diffuse_color=(ROBOT_WHITE,) * 3, roughness=ROBOT_WHITE_ROUGHNESS, metallic=0.0
+    )
+    white_cfg.func(white_path, white_cfg)
+    white = UsdShade.Material(stage.GetPrimAtPath(white_path))
+    alu_path = "/World/Looks/RobotAluminum"  # the flange ring and base fittings (CAD colour 192,192,192)
+    alu_cfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.47), roughness=0.4, metallic=0.3)
+    alu_cfg.func(alu_path, alu_cfg)
+    alu = UsdShade.Material(stage.GetPrimAtPath(alu_path))
+
+    def rebind(prims, names, mat=None):
+        n = 0
+        for c in prims:
+            m = UsdShade.MaterialBindingAPI(c).ComputeBoundMaterial()[0]
+            if m and any(k in m.GetPath().name for k in names):
+                UsdShade.MaterialBindingAPI.Apply(c).Bind(mat or white)
+                n += 1
+        return n
+
+    recoloured = 0
+    whites = ("color_202_209_238", "color_255_255_255")
+    for i in range(0, 8):
+        mesh = stage.GetPrimAtPath(f"{root}/fr3_link{i}/visuals")
+        parts = [mesh] + [c for c in mesh.GetChildren() if c.GetTypeName() == "GeomSubset"]
+        # Dark grey (color_64_64_64) on the real arm: link0 base parts, the pilot pad on top of link6 and
+        # the button / side oval on link7. Everywhere else (links 1-5, link6's joint band) it is white.
+        dark_to_white = ("color_64_64_64",) if 1 <= i <= 5 else ()
+        recoloured += rebind(parts, whites + dark_to_white)
+        recoloured += rebind(parts, ("color_192_192_192",), alu)
+    recoloured += split_link6_pad(stage, f"{root}/fr3_link6/visuals", white)
+    props = f"{ISAACLAB_NUCLEUS_DIR}/Robots/FrankaEmika/Props"
+    for link, panda in (("fr3_hand", "panda_hand"), ("fr3_leftfinger", "panda_leftfinger"), ("fr3_rightfinger", "panda_rightfinger")):
+        UsdGeom.Imageable(stage.GetPrimAtPath(f"{root}/{link}/visuals")).MakeInvisible()
+        vis = stage.DefinePrim(f"{root}/{link}/panda_visuals", "Xform")
+        vis.GetReferences().AddReference(f"{props}/{panda}.usd", "/Root")
+        vis.SetInstanceable(False)  # so its white plastic can be rebound below
+        recoloured += rebind([c for c in Usd.PrimRange(vis) if c.GetTypeName() in ("Mesh", "GeomSubset")], ("PlasticWhite",))
+    print(f"[robot] fr3 appearance: {recoloured} parts rebound (RobotWhite {ROBOT_WHITE} / RobotAluminum), Panda hand/finger visuals")
 
 camera_prim_paths = ["/World/CameraSensor"]
 
@@ -739,6 +863,9 @@ def main():
     robot_prefix = "fr3" if args_cli.robot == "fr3" else "panda"
     robot_cfg.init_state.pos = pos
     robot = Articulation(cfg=robot_cfg)
+    apply_scene_appearance()
+    if args_cli.robot == "fr3":
+        apply_fr3_appearance()
 
     # Setup camera sensor (wrist)
     wrist_camera_cfg = CameraCfg(
