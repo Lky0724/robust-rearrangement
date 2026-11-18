@@ -49,6 +49,11 @@ parser.add_argument(
     "--robot-mask", action="store_true",
     help="also save robot_mask_front (bool HxW): front-camera pixels that change when the arm is hidden",
 )
+parser.add_argument(
+    "--save-size", choices=["full", "240x320"], default="full",
+    help="full: wrist 480x640, front 720x960 (color_image2) and 480x640 (color_image3), ~3.9 MB/frame; "
+    "240x320: both cameras at the zarr resolution, ~0.46 MB/frame (use this for batch rendering)",
+)
 parser.add_argument("-fw", "--flipped-wrist-camera", action="store_true")
 parser.add_argument("-dr", "--domain-rand", action="store_true")
 
@@ -128,9 +133,8 @@ DEMO_DIR = Path(args_cli.load_dir)
 # Catch all files in all subfolder that end with .pkl or .pkl.xz
 FILES = sorted(list(DEMO_DIR.rglob("*.pkl")) + list(DEMO_DIR.rglob("*.pkl.xz")))
 
-# Set the random seed then shuffle the files
-np.random.seed(0)
-np.random.shuffle(FILES)
+# No shuffle: -i is the index in sorted order, so batch loops (scripts/rerender_batch.sh) can map an
+# index to its file name and skip episodes that are already rendered.
 
 FILE = str(FILES[args_cli.demo_index])
 
@@ -479,11 +483,9 @@ def np2Vec3f(arr):
     return vec
 
 
-def resize(img: Union[np.ndarray, torch.Tensor]):
-    """Resizes `img` into ..."""
-    # th, tw = 240, 320
-    # th, tw = 480, 640
-    th, tw = 720, 960
+def resize(img: Union[np.ndarray, torch.Tensor], size: Tuple[int, int] = (720, 960)):
+    """Resizes `img` (H, W, C) or (B, H, W, C) to `size` = (H, W)."""
+    th, tw = size
     was_numpy = False
 
     if isinstance(img, np.ndarray):
@@ -1309,32 +1311,28 @@ def main():
 
         if args_cli.save:
             # log the new observation
-            wrist_image = (
-                resize(wrist_camera.data.output["rgb"][0, :, :, :3]).cpu().numpy()
-            )
-            front_image = resize(camera.data.output["rgb"][0, :, :, :3]).cpu().numpy()
-
-            # print(f"front_image shape: {front_image.shape}")
-
-            # log the new observation
+            wrist_rgb = wrist_camera.data.output["rgb"][0, :, :, :3]
+            front_rgb = camera.data.output["rgb"][0, :, :, :3]
             # .copy(): on a CPU sim .cpu().numpy() is a view of the camera buffer, so without it every
             # saved frame would end up showing the last rendered image.
-            wrist_image = wrist_camera.data.output["rgb"][0, :, :, :3].cpu().numpy().copy()
-            front_image2 = camera.data.output["rgb"][0, :, :, :3].cpu().numpy().copy()
+            front_image2 = front_rgb.cpu().numpy().copy()
 
-            # print(f"front_image shape: {front_image.shape}")
-
-            new_obs = dict(
-                color_image1=wrist_image,
-                color_image2=front_image,
-                color_image3=front_image2,
-                robot_state=obs["robot_state"],
-            )
+            if args_cli.save_size == "240x320":
+                # Both cameras at the zarr resolution, resized the way process_pickles would resize them.
+                # color_image2 is the front camera; there is no color_image3.
+                new_obs = dict(
+                    color_image1=resize(wrist_rgb, (240, 320)).cpu().numpy(),
+                    color_image2=resize(front_rgb, (240, 320)).cpu().numpy(),
+                    robot_state=obs["robot_state"],
+                )
+            else:
+                new_obs = dict(
+                    color_image1=wrist_rgb.cpu().numpy().copy(),
+                    color_image2=resize(front_rgb).cpu().numpy(),
+                    color_image3=front_image2,
+                    robot_state=obs["robot_state"],
+                )
             if args_cli.robot_mask:
-                # On a CPU sim, .cpu().numpy() aliases the camera buffer; copy before re-rendering.
-                front_image2 = front_image2.copy()
-                wrist_image = wrist_image.copy()
-                new_obs["color_image1"], new_obs["color_image3"] = wrist_image, front_image2
                 # Render the same frame once more with the arm hidden; pixels that change are the robot
                 # (and its shadow). Then show the arm again so the next frames are unaffected.
                 robot_root = prim_utils.get_prim_at_path("/World/Robot_2")
@@ -1352,7 +1350,11 @@ def main():
                 for _ in range(max(args_cli.sub_steps, 1) + 2):
                     sim.render()
                 diff = np.abs(front_image2.astype(np.int16) - no_robot.astype(np.int16)).max(-1)
-                new_obs["robot_mask_front"] = diff > 12
+                mask = diff > 12
+                if args_cli.save_size == "240x320":
+                    # A 240x320 pixel is robot if any of its 2x2 pixels in the 480x640 render is
+                    mask = mask.reshape(240, 2, 320, 2).any(axis=(1, 3))
+                new_obs["robot_mask_front"] = mask
             episode_data["observations"].append(new_obs)
 
     e = time.time()
@@ -1360,8 +1362,12 @@ def main():
 
     if args_cli.save:
         print(f"Saving new pickle to: {pkl_path}")
-        with open(pkl_path, "wb") as f:
+        # Write under a temporary name and rename, so a run killed mid-write leaves no file that batch
+        # loops would take for a finished episode. The name doesn't match *.pkl*, so processing skips it.
+        tmp_path = pkl_path.with_name(pkl_path.stem + ".partial")
+        with open(tmp_path, "wb") as f:
             pickle.dump(episode_data, f)
+        os.replace(tmp_path, pkl_path)
 
 
 if __name__ == "__main__":
