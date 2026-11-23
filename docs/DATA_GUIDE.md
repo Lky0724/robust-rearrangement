@@ -401,9 +401,9 @@ python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s tel
 
 Conventions are shared across stages. Rotations are converted in [src/common/geometry.py](src/common/geometry.py), with quaternions in xyzw order. Images are resized again to 224×224 inside the model.
 
-### Cutting one phase out of `one_leg` demos
+### Cutting phases out of `one_leg` demos
 
-The `skills` annotations are empty in `one_leg` data, so [src/data_processing/segment_demos.py](src/data_processing/segment_demos.py) detects the phases from `parts_poses` and the gripper action. Both inputs use the same detector:
+[src/data_processing/segment_demos.py](src/data_processing/segment_demos.py) cuts a phase, or a run of consecutive phases, out of full `one_leg` demos. It reads a zarr or a folder of pickles:
 
 ```bash
 # Zarr → .../teleop/low/success/insert.zarr, train with data.suffix=insert
@@ -412,30 +412,81 @@ python -m src.data_processing.segment_demos processed data/processed/diffik/sim/
 # Pickles → .../teleop/low/insert/success/*.pkl, then convert them
 python -m src.data_processing.segment_demos raw data/raw/diffik/sim/one_leg/teleop/low/success
 python -m src.data_processing.process_pickles -c diffik -d sim -f one_leg -s teleop -r low -o success --suffix insert --output-suffix insert
+
+# Insert and screw together
+python -m src.data_processing.segment_demos processed <zarr> --phase insert --through screw --output-suffix insert_screw
 ```
 
-| `--phase` | From | To |
+| `--phase` / `--through` | From | To |
 |---|---|---|
-| `setup` | Start of the demo | Leg grasped |
-| `transport` | Leg grasped | Leg stays within `--start-radius` of the hole it ends up in |
-| `insert` (default) | End of `transport` | First gripper release with the leg in a hole, so the gripper is closed throughout |
+| `setup` | Start of the demo | Leg grasped (the last gripper close before the insertion start) |
+| `transport` | Leg grasped | Insertion start |
+| `insert` (default) | Insertion start | First gripper release after it, so the gripper is closed throughout |
 | `screw` | That release | End of the demo |
+
+`--phase` is the first phase kept and `--through` the last (default: the same one).
+
+**Where the insertion start comes from (`--detect`):**
+
+| Value | Insertion start | Data |
+|---|---|---|
+| `poses` | Last time the leg is farther than `--start-radius` from the hole it is released in. The release must have the leg in a hole | Sim: needs the 42-D `parts_poses` |
+| `marks` | A row of the `--marks` CSV, else the first 1 in the episode's `skills` (pickle) or `skill` (zarr) | Real demos recorded with the `` ` `` key in [teleop_sm_fr3.py](src/real/teleop_sm_fr3.py) ([4_REAL_ROBOT_FR3_GUIDE.md](4_REAL_ROBOT_FR3_GUIDE.md) §6), or any demo listed in a CSV |
+| `auto` (default) | A `--marks` row, else `poses`, else the recorded mark | Both |
+
+`skills` is all zeros in the released `one_leg` data, so `auto` uses the poses there. With marks, the release is the first gripper open after the mark, and a mark with the gripper open is rejected. The marks CSV has one `name,step` row per episode. `name` is the pickle file name, with or without its extension, and `step` is the first step of the insertion as `visualize_data.py video` numbers it. A header line and `#` comments are allowed:
+
+```text
+name,step
+2026-11-20T10:31:05,212
+```
 
 | Option | Default | Effect |
 |---|---|---|
-| `--start-radius` | `0.05` | Lateral distance from the hole where `insert` starts, in meters. Larger values keep more of the transport |
-| `--near-lateral`, `--near-axial` | `0.02` | How close to the seated pose a release must be to count as inserted, in meters |
-| `--pre-steps`, `--post-steps` | `0` | Extra steps around the phase. `--post-steps 10` keeps the release |
+| `--through` | `--phase` | Last phase kept |
+| `--detect`, `--marks` | `auto`, none | See above |
+| `--start-radius` | `0.05` | `poses` only: lateral distance from the hole where `insert` starts, in meters. Larger values keep more of the transport |
+| `--near-lateral`, `--near-axial` | `0.02` | `poses` only: how close to the seated pose a release must be to count as inserted, in meters |
+| `--pre-steps`, `--post-steps` | `0` | Extra steps around the kept phases. `--post-steps 10` keeps the release |
 | `--output`, `--output-suffix` | path grammar, `insert` | Where to write. The defaults keep the data out of what training reads without a suffix |
 | `--dry-run` | off | Print each episode's segment and write nothing |
 
-Episodes without an insertion (no release near a hole, or no `parts_poses`) are skipped and listed. Each output records its segments: `attrs["segment"]` in a zarr, `data["segment"]` in a pickle.
+Episodes that can't be cut are skipped and listed with the reason. Each output records its segments and how each start was found: `attrs["segment"]` in a zarr, `data["segment"]` in a pickle.
+
+**Real demos.** Record full demos with marks, process them once, and cut the zarr, not the pickles:
+
+```bash
+python -m src.data_processing.process_pickles -c diffik -d real -f one_leg_real -s teleop -r low -o success
+python -m src.data_processing.segment_demos processed data/processed/diffik/real/one_leg_real/teleop/low/success.zarr \
+    --phase insert --through screw --output-suffix insert_screw [--marks fixes.csv]
+```
+
+The cut zarr then holds exactly the steps of the full zarr, with the same action labels (see the first point below). Real zarrs store an empty `parts_poses`, and the cut copies it unchanged.
 
 Things to know before using a segment:
 
-- **The two routes differ in their rotation actions.** Everything else is identical, but the episode-wide rotation scaling (§11, pitfall 4) depends on the array it is given. A segmented zarr keeps the factor of its full demo, and a segmented pickle is scaled over the segment only, so it gets a larger factor (about 1.0 instead of about 0.1 in our `med` teleop pickles). Don't mix the two routes in one dataset. The released `one_leg` teleop zarrs have no raw pickles on S3, so they can only use the zarr route.
-- **Segments are short for the default horizons.** `insert` has a median of about 40 steps, and with `pred_horizon=32`, `action_horizon=8` the last 24 steps of an episode never appear as an observation, which is most of the insertion. On `teleop/low` that leaves 858 samples from 2057 steps, and 2 of the 50 episodes contribute none. `pred_horizon=16` gives 1657 samples and `pred_horizon=8` gives all 2057.
+- **The two routes differ in their rotation actions.** Everything else is identical, but the episode-wide rotation scaling (§11, pitfall 4) depends on the array it is given. A segmented zarr keeps the factor of its full demo, and a segmented pickle is scaled over the segment only, so it gets a larger factor (about 1.0 instead of about 0.1 for `insert` in our `med` teleop pickles). Don't mix the two routes in one dataset, and don't mix pickle-route segments with full demos. The released `one_leg` teleop zarrs have no raw pickles on S3, so they can only use the zarr route.
+- **Segments are short for the default horizons.** `insert` has a median of about 40 steps, and with `pred_horizon=32`, `action_horizon=8` the last 24 steps of an episode never appear as an observation, which is most of the insertion. On `teleop/low` that leaves 858 samples from 2057 steps, and 2 of the 50 episodes contribute none. `pred_horizon=16` gives 1657 samples and `pred_horizon=8` gives all 2057. `insert` through `screw` (median about 550 steps) loses little.
 - **Evaluation still starts from a full reset.** A policy trained on `insert` only has seen no grasp or transport, so the success rate from `bc.py`'s evaluation doesn't measure it.
+- **Sim and real starts differ in definition.** Sim starts are geometric (`--start-radius`), real ones are wherever the operator pressed the key. Stopping about 5 cm above the hole before pressing brings the two close.
+- **Zarrs with fewer than 4 episodes don't load for training** (§11, pitfall 9). That only matters for small test cuts.
+
+**Training on segments.** Three ways to use the same full recordings, by how the policy is deployed:
+
+| Use | Training data | Deployment |
+|---|---|---|
+| Full task, insertion oversampled | The full zarr and its `insert_screw` cut together (`data.data_paths_override` lists both), so those steps are seen twice per epoch | Unchanged, from a full reset. Only valid with zarr-route cuts, whose labels match the full zarr |
+| Two chained policies | `--phase setup --through transport` for the first, `--phase insert --through screw` for the second, both cut at the same marks | Run the first until the end effector is near the pre-insertion pose with the gripper closed, then switch. The first policy's end states and the second's start states come from the same steps |
+| Insert and screw only | The `insert_screw` cut | Bring the robot, holding the leg, to the pre-insertion pose by hand or script, then start the policy |
+
+For the first use, the override takes paths relative to `$DATA_DIR_PROCESSED/processed/`:
+
+```bash
+python -m src.train.bc ... \
+    'data.data_paths_override=[diffik/real/one_leg_real/teleop/low/success.zarr,diffik/real/one_leg_real/teleop/low/success/insert_screw.zarr]'
+```
+
+None of these has been tried on real data yet. Train a policy on the full demos as a baseline, since it uses the same recordings. In the first use, a held-out episode's cut can still be in the training set, which makes the test loss slightly optimistic.
 
 ---
 
@@ -1183,3 +1234,4 @@ Run these with `RESIP_ROBOT_URDF` (and `RESIP_ROBOT_FLIP_VISUALS`) set and `LD_L
 6. **Real teleop marks every saved demo as a success.** Filter bad demos yourself before processing.
 7. **Watch the size of large zarrs.** By default (`data.load_into_memory=true`, [bc.py:202](src/train/bc.py#L202)), `ImageDataset` copies all images into RAM, so a 30 GB render needs about that much memory. Set `data.load_into_memory=false` to keep images on disk and read them from the zarr per sample.
 8. **Some recorded tabletop quaternions are wrong.** When the tabletop sits almost exactly at its nominal orientation, a recorded quaternion can jump from about `(0, .707, -.707, 0)` to `(0, .707, .707, 0)`, which is the same pose turned upside down, for a single step. This affects 66 of the 76,389 steps in the released `one_leg` teleop zarrs, in 16 of the 150 episodes. The cause isn't verified. Those values go into the state policy's observations unchanged. `segment_demos.py` corrects them for its own detection and leaves the stored data as it is. Anything that computes a pose relative to the tabletop has to handle them too.
+9. **Zarrs with fewer episodes than letters in their domain don't load.** [combine_zarr_datasets](src/dataset/zarr.py#L156) looks up `attrs["domain"][:max_episodes]`, which cuts the domain *string* to the episode count. A 3-episode real zarr becomes `"rea"` and fails with `KeyError: 'rea'`. Real zarrs need at least 4 episodes and sim zarrs at least 3. Real datasets are larger than that, so in practice only small test cuts hit it. Not fixed.

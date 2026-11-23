@@ -292,12 +292,35 @@ What gets recorded (the format `process_pickles` expects; keep it if you rewrite
 | `observations[t].robot_state` | `ee_pos`, `ee_quat` (xyzw, **tip** frame), `ee_pos_vel`, `ee_ori_vel` (J·q̇), `gripper_width` |
 | `actions[t]` | delta between consecutive **teleop targets** (not measured poses): xyz, quat xyzw as a right-multiplied rotation, ±1 grasp flag |
 | `furniture`, `success=True`, `args`, `metadata` | task name; teleop scalars and gains |
+| `skills` | [teleop_sm_fr3.py](../src/real/teleop_sm_fr3.py) only: 1 on the step recorded after each `` ` `` press, 0 elsewhere (see below) |
 
 Then process it into D_real:
 
 ```bash
 python -m src.data_processing.process_pickles -c diffik -d real -f one_leg_real -s teleop -r low -o success
 ```
+
+### Marking the insertion start
+
+Real demos have no part poses, so the phases of a demo can't be detected afterwards the way they are in sim. [teleop_sm_fr3.py](../src/real/teleop_sm_fr3.py) lets you mark the insertion start while you record, so one full recording can later give the insert and screw part on its own ([DATA_GUIDE.md](DATA_GUIDE.md) §5, "Cutting phases out of `one_leg` demos"). The original `teleop_sm.py` doesn't record marks.
+
+In each demo:
+1. Grasp the leg and bring it about **5 cm above the hole**, roughly aligned. This matches where the sim segmentation starts the insertion (`--start-radius 0.05`).
+2. Stop, press `` ` ``, then start the descent. The terminal prints `Mark 1: insertion start at step N`.
+3. Finish the demo as usual. No key is needed for the screwing: it starts at the first gripper release after the mark.
+
+How the mark is stored:
+- Steps without input aren't recorded, so the mark goes on the **next recorded step**, the first step of the descent.
+- Holding the key counts as one press. A second press adds a second mark, but segmentation uses only the first. At the end, the script prints the marks it saved, or a warning if there are none.
+- The mark needs the gripper closed. A demo with no mark, or with a wrong one, can still be cut: find the step in `visualize_data.py video`, which shows the step number on each frame, and list it in a `--marks` CSV.
+- At startup, the script warns if `rdt`'s `CollectEnum` has no `SKILL`. The `` ` `` binding itself is in `rdt`'s `KeyboardInterface` and hasn't been checked on the lars-dev branch. If the first press prints nothing, check it:
+
+  ```bash
+  python -c "from rdt.common.demo_util import CollectEnum; print(list(CollectEnum))"
+  python -c "import inspect, rdt.common.keyboard_interface as k; print(inspect.getsource(k))" | grep -n -A2 '"`"'
+  ```
+
+Stopping at the same pre-insertion pose every time pays off twice: the segments start from a compact set of states, and an insert-and-screw policy can be deployed from that pose.
 
 Checks:
 - View a few demos as recorded ([DATA_GUIDE.md](DATA_GUIDE.md) §9). Confirm the image content and the camera order.

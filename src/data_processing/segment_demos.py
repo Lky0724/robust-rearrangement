@@ -1,12 +1,24 @@
-"""Cut one phase (by default the leg insertion) out of full one_leg demos.
-
-The `skills` annotations are empty in the one_leg data, so the phases are detected
-from the leg pose relative to the tabletop and the gripper action:
+"""Cut one phase, or a run of phases, out of full one_leg demos.
 
     setup      start of the demo -> leg grasped (includes pushing the tabletop into the fixture)
-    transport  leg grasped -> leg within --start-radius of the hole it ends up in
-    insert     end of transport -> first gripper release with the leg in a hole
+    transport  leg grasped -> insertion start
+    insert     insertion start -> first gripper release after it
     screw      that release -> end of the demo (regrasps, screwing and retreat)
+
+`--phase insert --through screw` keeps insert and screw. The insertion start comes from
+one of two places (--detect):
+
+    poses  the leg pose relative to the tabletop: the last time the leg is farther than
+           --start-radius from the hole it is released in. Needs the 42D parts_poses, so
+           it works on sim data only
+    marks  an insertion mark: a row of the --marks CSV, or else the first 1 in the
+           episode's `skills` (the ` key in teleop_sm_fr3.py). Works on real demos
+    auto   (default) a --marks row, else poses, else the recorded mark
+
+Marks CSV, one row per episode, `name,step` where name is the pickle file name without its
+extension and step the first step of the insertion (as shown by visualize_data.py video):
+
+    2026-11-20T10:31:05,212
 
 Zarrs:
     python -m src.data_processing.segment_demos processed \
@@ -38,6 +50,7 @@ from scipy.spatial.transform import Rotation as R
 from src.visualization.render_mp4 import pickle_data, unpickle_data
 
 PHASES = ("setup", "transport", "insert", "screw")
+PICKLE_SUFFIXES = (".pkl", ".gz", ".xz")
 
 # Layout of the 42D parts_poses in one_leg: 6 x (pos + quat xyzw)
 POSE_DIM = 7
@@ -81,8 +94,7 @@ def find_phases(
     """Return {phase: (start, end)} with `end` exclusive, or None if no insertion is found."""
     n_steps = len(gripper_action)
 
-    # Policies can flicker the gripper sign for a step or two around a toggle
-    gripper = median_filter(np.sign(gripper_action), size=5, mode="nearest")
+    gripper = filtered_gripper(gripper_action)
     toggles = np.flatnonzero(np.diff(gripper)) + 1
     opens, closes = toggles[gripper[toggles] < 0], toggles[gripper[toggles] > 0]
 
@@ -111,24 +123,120 @@ def find_phases(
     }
 
 
-def find_segment(parts_poses, gripper_action, args) -> Optional[Tuple[int, int]]:
-    """Return the (start, end) of the chosen phase with its margins, or None."""
-    phases = find_phases(
-        parts_poses,
-        gripper_action,
-        args.start_radius,
-        args.near_lateral,
-        args.near_axial,
+def filtered_gripper(gripper_action: np.ndarray) -> np.ndarray:
+    # Policies can flicker the gripper sign for a step or two around a toggle
+    return median_filter(np.sign(gripper_action), size=5, mode="nearest")
+
+
+def find_phases_from_mark(
+    mark: int, gripper_action: np.ndarray
+) -> Tuple[Optional[Dict[str, Tuple[int, int]]], Optional[str]]:
+    """Phases around an insertion start `mark`. Returns (phases, None) or (None, reason)."""
+    n_steps = len(gripper_action)
+    if not 0 <= mark < n_steps:
+        return None, f"mark {mark} is outside the {n_steps} steps"
+
+    gripper = filtered_gripper(gripper_action)
+    if gripper[mark] <= 0:
+        return None, f"gripper is open at the mark (step {mark})"
+
+    toggles = np.flatnonzero(np.diff(gripper)) + 1
+    opens, closes = toggles[gripper[toggles] < 0], toggles[gripper[toggles] > 0]
+
+    grasps = closes[closes <= mark]
+    grasp = int(grasps[-1]) if len(grasps) else 0
+    releases = opens[opens > mark]
+    release = int(releases[0]) if len(releases) else n_steps
+
+    return {
+        "setup": (0, grasp),
+        "transport": (grasp, mark),
+        "insert": (mark, release),
+        "screw": (release, n_steps),
+    }, None
+
+
+def episode_segment(
+    args,
+    task: str,
+    parts_poses: Optional[np.ndarray],
+    gripper_action: np.ndarray,
+    skills: Optional[np.ndarray],
+    csv_mark: Optional[int],
+) -> Tuple[Optional[Tuple[int, int]], str]:
+    """Return ((start, end), method) for the chosen phases with margins, or (None, reason)."""
+    n_steps = len(gripper_action)
+    has_poses = parts_poses is not None and parts_poses.shape[1:] == (N_PARTS_POSES,)
+
+    use_poses = args.detect == "poses" or (
+        args.detect == "auto" and csv_mark is None and has_poses
     )
-    if phases is None:
-        return None
-    start, end = phases[args.phase]
-    return max(start - args.pre_steps, 0), min(end + args.post_steps, len(parts_poses))
+    if use_poses:
+        if task != "one_leg":
+            return None, f"task is {task}, pose detection only knows one_leg"
+        if not has_poses:
+            return None, "no one_leg parts_poses"
+        phases = find_phases(
+            parts_poses,
+            gripper_action,
+            args.start_radius,
+            args.near_lateral,
+            args.near_axial,
+        )
+        method = "poses"
+        if phases is None:
+            return None, "no gripper release with the leg in a hole"
+    else:
+        if csv_mark is not None:
+            mark, method = csv_mark, "csv mark"
+        elif skills is not None and len(skills) == n_steps and np.any(skills > 0):
+            mark, method = int(np.flatnonzero(skills > 0)[0]), "recorded mark"
+        else:
+            return None, "no insertion mark (no 1 in skills and no --marks row)"
+        phases, reason = find_phases_from_mark(mark, gripper_action)
+        if phases is None:
+            return None, reason
+        method = f"{method} at {mark}"
+
+    start, end = phases[args.phase][0], phases[args.through][1]
+    if start >= end:
+        return None, f"{args.phase}..{args.through} is empty"
+    return (max(start - args.pre_steps, 0), min(end + args.post_steps, n_steps)), method
+
+
+def episode_key(name: str) -> str:
+    """Pickle file name without directories or extensions, the key of a --marks row."""
+    name = Path(str(name)).name
+    while Path(name).suffix in PICKLE_SUFFIXES:
+        name = Path(name).stem
+    return name
+
+
+def read_marks(path: Optional[str]) -> Dict[str, int]:
+    if path is None:
+        return {}
+    marks = {}
+    for i, line in enumerate(Path(path).read_text().splitlines()):
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        fields = [f.strip() for f in line.split(",")]
+        try:
+            marks[episode_key(fields[0])] = int(fields[1])
+        except (IndexError, ValueError):
+            if i == 0:  # header
+                continue
+            raise SystemExit(f"{path}:{i + 1}: expected `name,step`, got {line!r}")
+    print(f"Read {len(marks)} marks from {path}")
+    return marks
 
 
 def segment_params(args) -> dict:
     return {
         "phase": args.phase,
+        "through": args.through,
+        "detect": args.detect,
+        "marks": args.marks,
         "start_radius": args.start_radius,
         "near_lateral": args.near_lateral,
         "near_axial": args.near_axial,
@@ -137,9 +245,9 @@ def segment_params(args) -> dict:
     }
 
 
-def report(segments: List[Tuple[str, int, int, int]], skipped: List[Tuple[str, str]]):
-    for name, start, end, n_steps in segments:
-        print(f"  {name}: [{start}, {end}) = {end - start} of {n_steps} steps")
+def report(segments: List[Tuple[str, int, int, int, str]], skipped: List[Tuple[str, str]]):
+    for name, start, end, n_steps, method in segments:
+        print(f"  {name}: [{start}, {end}) = {end - start} of {n_steps} steps ({method})")
     for name, reason in skipped:
         print(f"  SKIPPED {name}: {reason}")
 
@@ -147,7 +255,7 @@ def report(segments: List[Tuple[str, int, int, int]], skipped: List[Tuple[str, s
     if not segments:
         raise SystemExit("No episode could be segmented, nothing was written")
 
-    lengths = [end - start for _, start, end, _ in segments]
+    lengths = [end - start for _, start, end, _, _ in segments]
     print(
         f"Segment length: min {min(lengths)}, median {int(np.median(lengths))}, "
         f"max {max(lengths)}, total {sum(lengths)} steps"
@@ -171,6 +279,7 @@ def segment_pickles(args):
         raise SystemExit("The output directory must differ from the input directory")
     print(f"Output directory: {out_dir}")
 
+    marks = read_marks(args.marks)
     segments, skipped = [], []
     for path in paths:
         out_path = out_dir / path.name
@@ -182,24 +291,20 @@ def segment_pickles(args):
         n_steps = len(data["actions"])
         obs = data["observations"]
 
-        if task != "one_leg":
-            skipped.append((path.name, f"task is {task}, not one_leg"))
-            continue
-        if np.size(obs[0].get("parts_poses", [])) != N_PARTS_POSES:
-            skipped.append((path.name, "no one_leg parts_poses"))
-            continue
-
-        parts_poses = np.array([o["parts_poses"] for o in obs[:n_steps]])
+        parts_poses = None
+        if np.size(obs[0].get("parts_poses", [])) == N_PARTS_POSES:
+            parts_poses = np.array([o["parts_poses"] for o in obs[:n_steps]])
+        skills = np.asarray(data["skills"]) if "skills" in data else None
         actions = np.array(data["actions"])
-        segment = find_segment(parts_poses, actions[:, -1], args)
-        if segment is None or segment[0] == segment[1]:
-            skipped.append(
-                (path.name, f"no {args.phase} phase found in {n_steps} steps")
-            )
+        segment, method = episode_segment(
+            args, task, parts_poses, actions[:, -1], skills, marks.get(episode_key(path.name))
+        )
+        if segment is None:
+            skipped.append((path.name, method))
             continue
 
         start, end = segment
-        segments.append((path.name, start, end, n_steps))
+        segments.append((path.name, start, end, n_steps, method))
         if args.dry_run:
             continue
 
@@ -213,6 +318,7 @@ def segment_pickles(args):
             "start": start,
             "end": end,
             "source_steps": n_steps,
+            "method": method,
             **segment_params(args),
         }
 
@@ -265,35 +371,39 @@ def segment_zarr(args):
 
     episode_ends = src["episode_ends"][:]
     n_total = int(episode_ends[-1])
-    if src["parts_poses"].shape[1:] != (N_PARTS_POSES,):
-        raise SystemExit(f"{in_path} has no one_leg parts_poses")
 
-    parts_poses = src["parts_poses"][:]
+    # Real demos have no part poses; process_pickles stores an empty array for them
+    parts_poses = None
+    if src["parts_poses"].shape == (n_total, N_PARTS_POSES):
+        parts_poses = src["parts_poses"][:]
+    skills = src["skill"][:] if "skill" in src else None
     gripper_action = src["action/delta"][:, -1]
     names = src["pickle_file"][:]
     tasks = src["task"][:]
+    marks = read_marks(args.marks)
 
     keep, ranges, segments, skipped = [], [], [], []
     ep_start = 0
     for i, ep_end in enumerate(episode_ends):
         ep_end = int(ep_end)
         name = f"{i} ({names[i]})"
-        segment = None
-        if tasks[i] == "one_leg":
-            segment = find_segment(
-                parts_poses[ep_start:ep_end], gripper_action[ep_start:ep_end], args
-            )
         n_steps = ep_end - ep_start
+        segment, method = episode_segment(
+            args,
+            tasks[i],
+            None if parts_poses is None else parts_poses[ep_start:ep_end],
+            gripper_action[ep_start:ep_end],
+            None if skills is None else skills[ep_start:ep_end],
+            marks.get(episode_key(names[i])),
+        )
 
-        if tasks[i] != "one_leg":
-            skipped.append((name, f"task is {tasks[i]}, not one_leg"))
-        elif segment is None or segment[0] == segment[1]:
-            skipped.append((name, f"no {args.phase} phase found in {n_steps} steps"))
+        if segment is None:
+            skipped.append((name, method))
         else:
             start, end = segment
             keep.append(i)
             ranges.append((ep_start + start, ep_start + end))
-            segments.append((name, start, end, n_steps))
+            segments.append((name, start, end, n_steps, method))
         ep_start = ep_end
 
     report(segments, skipped)
@@ -319,6 +429,8 @@ def segment_zarr(args):
             new_shape = (n_out,) + array.shape[1:]
         elif array.shape[0] == len(episode_ends):
             new_shape = (len(keep),) + array.shape[1:]
+        elif array.size == 0:  # e.g. the parts_poses of real demos
+            new_shape = array.shape
         else:
             raise SystemExit(f"Unexpected length of {name}: {array.shape}")
 
@@ -337,6 +449,8 @@ def segment_zarr(args):
             object_codec=object_codec,
         )
         print(f"Writing {name} {new_shape}")
+        if array.size == 0:
+            continue
         if array.shape[0] == n_total:
             copy_steps(array, dst, ranges)
         else:
@@ -356,8 +470,9 @@ def segment_zarr(args):
     out.attrs["segment"] = {
         "source": str(in_path),
         "source_episode": keep,
-        "start": [start for _, start, _, _ in segments],
-        "end": [end for _, _, end, _ in segments],
+        "start": [start for _, start, _, _, _ in segments],
+        "end": [end for _, _, end, _, _ in segments],
+        "method": [method for _, _, _, _, method in segments],
         "skipped": [name for name, _ in skipped],
         **segment_params(args),
     }
@@ -379,6 +494,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-suffix", type=str, default="insert")
     parser.add_argument("--phase", type=str, choices=PHASES, default="insert")
+    parser.add_argument(
+        "--through",
+        type=str,
+        choices=PHASES,
+        default=None,
+        help="Last phase to keep (default: --phase). --phase insert --through screw "
+        "keeps insert and screw",
+    )
+    parser.add_argument(
+        "--detect",
+        type=str,
+        choices=["auto", "poses", "marks"],
+        default="auto",
+        help="Where the insertion start comes from: part poses (sim) or insertion "
+        "marks (real). auto: a --marks row, else poses, else the recorded mark",
+    )
+    parser.add_argument(
+        "--marks",
+        type=str,
+        default=None,
+        help="CSV of `name,step` insertion starts, overriding recorded marks",
+    )
     parser.add_argument(
         "--start-radius",
         type=float,
@@ -409,6 +546,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.through is None:
+        args.through = args.phase
+    if PHASES.index(args.through) < PHASES.index(args.phase):
+        parser.error(f"--through {args.through} comes before --phase {args.phase}")
+    if args.marks and args.detect == "poses":
+        parser.error("--marks has no effect with --detect poses")
 
     if args.source == "raw":
         segment_pickles(args)

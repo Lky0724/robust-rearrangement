@@ -767,6 +767,7 @@ git diff src/real/teleop_sm.py
 |---|---|
 | `--server_ip` option, default `localhost` | Change 2 as an option instead of a fixed value. Only needed if the Polymetis server runs on another PC |
 | `--no_gripper` option | Starts without a gripper server. A stand-in gripper (class `NoGripper`) accepts the open/close commands and reports the commanded width as `gripper_width`: 6.5 cm when open, 0 after "close" (the Franka Hand closes fully when there's nothing to grasp) |
+| `` ` `` key: insertion mark | Records `skills` in each episode: 1 on the step recorded after a `` ` `` press, 0 elsewhere. Marks the insertion start so `segment_demos.py` can cut insert and screw out of the full demo later. See [4_REAL_ROBOT_FR3_GUIDE.md](4_REAL_ROBOT_FR3_GUIDE.md) §6 |
 
 To see every difference from the original:
 ```bash

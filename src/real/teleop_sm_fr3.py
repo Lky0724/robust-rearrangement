@@ -7,6 +7,8 @@ Changes from teleop_sm.py, see docs/FR3_ORIGINAL_CODE_TELEOP_TEST.md §8:
 - DiffIKWrapper is built with the arguments the rdt lars-dev constructor requires.
 - --no_cameras: no RealSense cameras; black 640x480 placeholder images are saved instead.
 - --no_gripper: no gripper server; a stand-in gripper reports the commanded width.
+- The ` key (CollectEnum.SKILL) marks the insertion start: the next recorded step gets 1
+  in the pickle's `skills`, every other step 0. segment_demos.py cuts phases at the first mark.
 """
 
 from pathlib import Path
@@ -495,6 +497,8 @@ def main():
     episode_data = {}
     episode_data["observations"] = []
     episode_data["actions"] = []
+    # 1 on the step recorded after each ` press (insertion start), 0 elsewhere
+    episode_data["skills"] = []
     episode_data["furniture"] = args.furniture
     # assume all real world demos that we actually save are success
     episode_data["success"] = True
@@ -511,6 +515,11 @@ def main():
 
     # Setup other interfaces
     keyboard = KeyboardInterface()
+    skill_enum = getattr(CollectEnum, "SKILL", None)
+    if skill_enum is None:
+        print("WARNING: this CollectEnum has no SKILL, the insertion start can't be marked")
+    else:
+        print("Press ` with the leg held about 5 cm above the hole to mark the insertion start")
 
     def polypose2target(poly_pose):
         translation, quat_xyzw = poly_pose[0], poly_pose[1]
@@ -574,6 +583,10 @@ def main():
             )
             global_start_time = time.time()
             print(f"Start collecting!")
+            # A ` press usually comes while the arm is still, and still steps aren't
+            # recorded, so the mark waits for the next recorded step
+            mark_pending = False
+            prev_skill = False
             while not stop:
                 # calculate timing
                 t_cycle_end = t_start + (iter_idx + 1) * dt
@@ -601,6 +614,17 @@ def main():
                 if collect_enum in [CollectEnum.SUCCESS, CollectEnum.FAIL]:
                     break
 
+                # Count a held or repeated SKILL as one press
+                is_skill = skill_enum is not None and collect_enum == skill_enum
+                if is_skill and not prev_skill:
+                    mark_pending = True
+                    n_marks = sum(episode_data["skills"]) + 1
+                    print(
+                        f"Mark {n_marks}: insertion start at step {len(episode_data['actions'])}"
+                        + ("" if n_marks == 1 else " (segment_demos uses the first mark)")
+                    )
+                prev_skill = is_skill
+
                 # send command to the robot
                 # robot.update_desired_ee_pose(action_next_pose_mat, dt=dt)
                 robot.update_desired_ee_pose(
@@ -619,6 +643,8 @@ def main():
                     )
                     episode_data["actions"].append(action)
                     episode_data["observations"].append(observation)
+                    episode_data["skills"].append(int(mark_pending))
+                    mark_pending = False
 
                 target_pose = polypose2target(robot.get_ee_pose())
                 tip_target_pose = wrist_target_to_tip(target_pose)
@@ -646,9 +672,18 @@ def main():
     global_total_time = time.time() - global_start_time
     print(f"Time elapsed: {global_total_time}")
     if collect_enum == CollectEnum.SUCCESS:
+        marks = [i for i, s in enumerate(episode_data["skills"]) if s]
+        if marks:
+            print(f"Insertion marks at steps {marks} of {len(episode_data['actions'])}")
+        else:
+            print(
+                "WARNING: no insertion mark. segment_demos skips this demo unless "
+                "it is listed in a --marks CSV"
+            )
         # save the data
         with open(pkl_path, "wb") as f:
             pickle.dump(episode_data, f)
+        print(f"Saved {pkl_path}")
 
 
 if __name__ == "__main__":
