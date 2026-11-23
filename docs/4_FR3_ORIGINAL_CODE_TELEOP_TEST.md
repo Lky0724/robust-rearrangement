@@ -768,6 +768,8 @@ git diff src/real/teleop_sm.py
 | `--server_ip` option, default `localhost` | Change 2 as an option instead of a fixed value. Only needed if the Polymetis server runs on another PC |
 | `--no_gripper` option | Starts without a gripper server. A stand-in gripper (class `NoGripper`) accepts the open/close commands and reports the commanded width as `gripper_width`: 6.5 cm when open, 0 after "close" (the Franka Hand closes fully when there's nothing to grasp) |
 | `` ` `` key: insertion mark | Records `skills` in each episode: 1 on the step recorded after a `` ` `` press, 0 elsewhere. Marks the insertion start so `segment_demos.py` can cut insert and screw out of the full demo later. See [4_REAL_ROBOT_FR3_GUIDE.md](4_REAL_ROBOT_FR3_GUIDE.md) §6 |
+| `--show_cameras` option | Opens a live window with the wrist and front cameras side by side (details below). Off by default |
+| Loop timing | At the end of every run, prints the time each 10 Hz step took and how many steps started late (details below) |
 
 To see every difference from the original:
 ```bash
@@ -781,7 +783,23 @@ Check that it loads in your env. `--help` exits before touching the robot:
 # (polymetis-local), in ~/ResiP
 python -m src.real.teleop_sm_fr3 --help
 ```
-The option list must end with `[--server_ip SERVER_IP] [--no_cameras] [--no_gripper]`. An import error here means a §6 step is missing.
+The option list must end with `[--server_ip SERVER_IP] [--no_cameras] [--no_gripper] [--show_cameras]`. An import error here means a §6 step is missing.
+
+**Live camera window (`--show_cameras`):**
+- Shows the two frames the loop already reads for recording, so there are no extra camera reads, and the recorded data is the same with or without it.
+- Each view is 320×240, as in the processed data: the wrist frame resized whole, the front frame cut to its central 4:3 part first. The yellow box on the front view is the 224×224 crop the policy sees at deployment. The fixture, the parts and the gripper's working area should stay inside it.
+- The bottom line shows `REC n` in red when the current step is recorded (`idle n` when it isn't, `n` = steps recorded so far), the gripper command and width, the insertion mark (`no mark`, `mark pending` until the next recorded step, `mark @ step k`), and the last step's loop time.
+- The window can be resized with the mouse. Keys still work while it has focus, because the keyboard listener is global.
+- Cost, measured without the robot on 2026-11-23: about 6.5 ms per step on average (max 11 ms), almost all of it the window redraw. Camera reads took about 15–31 ms per step, so a step stays well within its 100 ms. The 1 kHz control loop runs in the Polymetis processes, and the window can't take CPU time from `run_server` once it has the real-time priority from §12.1. If you see more `communication_constraints_violation` stops with the window on, run without it and compare.
+- If the window can't open (no display) or fails while running, the script prints a message and continues without it. The episode isn't lost.
+
+**Loop timing**, printed after `Time elapsed:` at the end of every run, for example:
+```
+Loop timing over <steps> steps: work mean <x> ms, p95 <x> ms, max <x> ms (budget 100 ms)
+  camera window: mean <x> ms, max <x> ms          # only with --show_cameras
+  steps that started more than 5 ms late: <n> (max <x> ms late)
+```
+`work` is everything in a step except the window: camera reads, robot state, command and meshcat. A step starts late when the previous one took longer than the 100 ms budget. A few late steps are harmless; many mean the recorded 10 Hz is really slower.
 
 **Running without a gripper (`--no_gripper`):**
 - Keep Desk's end effector set to **None** (*Settings → End-Effector*). The robot uses this setting to compensate the hand's weight; a wrong setting makes the arm drift.
@@ -854,7 +872,7 @@ What happens in order: the gripper opens to 6.5 cm (with `--no_gripper`, it prin
 3. Clear the error in Desk (or with the enabling device) so the robot is ready again (§2).
 4. Restart terminals 1 and 2 (§5.2), then terminal 4. Terminal 3 can keep running.
 
-Occasional stops on Path B are expected. If they happen every few seconds, recheck §1.5 and §1.6, close other programs, and consider Path A.
+Occasional stops on Path B are expected. If they happen every few seconds, recheck §1.5 and §1.6, apply the latency settings in §12.2, close other programs, and consider Path A.
 
 **✅ Go/no-go 8:** a–h all behave as expected.
 
@@ -1052,6 +1070,99 @@ Once everything above passes, a session is:
 4. Terminals 1–4 as in §9.1. Add `--no_cameras` only if the cameras aren't connected.
 5. Collect. Afterwards, shut down as in §9.4.
 
+### 12.1 Full command list (Path B, cameras and gripper mounted)
+
+These are steps 2–5 above as commands, plus three latency settings (§12.2) and logs of every terminal in `~/fr3_logs/`. Replace `enp2s0f0` with your robot port (§1.6).
+
+**Terminal 0, once after every reboot, before any server**
+```bash
+sudo ethtool --set-eee enp2s0f0 eee off     # §12.2 a; also redo after replugging the cable
+sudo chmod 666 /dev/cpu_dma_latency          # §12.2 b
+ethtool --show-eee enp2s0f0 | head -2        # must print: EEE status: disabled
+mkdir -p ~/fr3_logs
+```
+Run both before terminal 1. Changing EEE renegotiates the link, which would stop a running control loop. The robot client opens `/dev/cpu_dma_latency` only when it starts.
+
+**Terminal 1: robot server**
+```bash
+conda activate polymetis-local
+export FR3_IP=172.16.0.2
+PYTHONUNBUFFERED=1 stdbuf -oL -eL launch_robot.py robot_client=franka_hardware \
+    robot_client.executable_cfg.robot_ip=$FR3_IP use_real_time=false \
+    2>&1 | tee -i ~/fr3_logs/server_$(date +%F_%H%M%S).log
+```
+Wait for `Hold-still motion done; starting torque control.`. The log must not contain `failed to open /dev/cpu_dma_latency`. If it does, redo the `chmod` and restart this terminal.
+
+**Terminal 0, after every start of terminal 1**
+```bash
+chrt -a -f -p 70 $(pgrep -x run_server)      # §12.2 c
+chrt -p $(pgrep -x run_server)               # must print: SCHED_FIFO, priority 70
+```
+
+**Terminal 2: gripper server** (skip it with no gripper mounted, and add `--no_gripper` in terminal 4)
+```bash
+conda activate polymetis-local
+export FR3_IP=172.16.0.2
+PYTHONUNBUFFERED=1 launch_gripper.py gripper=franka_hand gripper.executable_cfg.robot_ip=$FR3_IP \
+    2>&1 | tee -i ~/fr3_logs/gripper_$(date +%F_%H%M%S).log
+```
+
+**Terminal 3: visualizer**
+```bash
+conda activate polymetis-local
+meshcat-server
+```
+
+**Terminal 4: teleop, with speed limits**
+```bash
+conda activate polymetis-local
+cd ~/ResiP
+python -u -m src.real.teleop_sm_fr3 -p 6000 --furniture one_leg \
+    --save_dir $DATA_DIR_RAW/raw/diffik/real/one_leg_real/teleop/low/success \
+    --max_pos_speed 0.10 --max_rot_speed 0.3 --show_cameras \
+    2>&1 | tee -i ~/fr3_logs/teleop_$(date +%F_%H%M%S).log
+```
+⚠️ The arm drives to home as soon as this starts (§9). Make sure the path is clear first.
+
+- **`--show_cameras`:** live wrist and front view (§8.2). Drop it to run without the window.
+- **Speed limits:** `--max_pos_speed 0.10 --max_rot_speed 0.3` give at most about 1.8 cm and 7° per 10 Hz step at full SpaceMouse deflection. Use `--max_rot_speed 0.2` to be more careful near singular poses (FR3_POLYMETIS_SAFETY_REVIEW.md).
+- **`--save_dir`:** points at the real dataset. For a test run, use `scratch/fr3_teleop_test` instead.
+- **Logging options:** `python -u`, `PYTHONUNBUFFERED=1` and `stdbuf -oL -eL` keep the output live on screen when it goes through `tee`. `tee -i` keeps writing the log while you press Ctrl+C, so the last lines aren't lost.
+- **End of an episode:** press `t` to save or `n` to discard. Nothing is saved otherwise: if the robot stops, the script crashes on its next command (`Tried to perform a controller update with no controller running.`) and the episode is lost.
+
+**Shut down:** terminal 4 first, then Ctrl+C in terminals 3, 2 and 1 (§9.4).
+
+**View a recorded episode (real camera video)**
+
+Use the `resip` env, not the Polymetis one. The robot and servers don't need to be running.
+```bash
+conda activate resip
+cd ~/ResiP
+P=$DATA_DIR_RAW/raw/diffik/real/one_leg_real/teleop/low/success/<timestamp>.pkl
+
+python scripts/visualize_data.py info  $P             # length, NaNs, gap between commanded and actual position
+python scripts/visualize_data.py video $P --fps 10    # wrist | front side by side, in real time
+```
+- **Output:** `viz/<timestamp>/<timestamp>_ep000.mp4`. Each frame shows the step number, the gripper command and the gripper width. Use the step numbers to find a missed insertion mark for a `--marks` CSV (REAL_ROBOT_FR3_GUIDE.md §6).
+- **Several episodes:** set `P` to the `success/` folder and pick episodes by their position in sorted file-name order, e.g. `--episodes 0 3 5`. Each pickle loads fully into memory, so add `--max-files N` on large folders.
+- **More options:** `plot` draws the EE path against the commanded target and the gripper width. All options are in [DATA_GUIDE.md](DATA_GUIDE.md) §9.2.
+
+Tested on 2026-11-23 on a 1152-step demo: `info` reported no problems, and `video` took about 30 s.
+
+### 12.2 Why the three latency settings
+
+Each 1 ms torque command goes from `franka_panda_client` to `run_server` over gRPC and back. If about 20 commands in a row don't reach the robot in time, it stops with `communication_constraints_violation`. On 2026-11-23, a teleop run with both cameras stopped this way after about 2 minutes, with `control_command_success_rate: 0.41`.
+
+These are the likely causes on this laptop. Which one triggered that stop hasn't been confirmed.
+
+| | Setting | Problem it addresses | Lasts until |
+|---|---|---|---|
+| a | `ethtool --set-eee … eee off` | Energy Efficient Ethernet lets the robot port (Realtek r8169) sleep between packets, and waking it adds delay | Reboot or cable replug |
+| b | `chmod 666 /dev/cpu_dma_latency` | The client tries to keep the CPU out of deep sleep states through this file, but only root can open it (`failed to open /dev/cpu_dma_latency` in the log) | Reboot |
+| c | `chrt -a -f -p 70 …` | With `use_real_time=false`, `run_server` runs at normal priority. The client's real-time thread (priority 80) waits for it every 1 ms, and cameras, meshcat and the browser compete with it. Priority 70 keeps it below the client. No `sudo` is needed because `ulimit -r` is 99 (§1.3) | Restart of terminal 1 |
+
+If stops continue with all three set, run the same teleop with `--no_cameras` for as long. If the stops go away, camera processing (two 640×480 streams with depth alignment) is the main load.
+
 ---
 
 ## 13. Troubleshooting
@@ -1061,7 +1172,7 @@ Once everything above passes, a session is:
 | `libfranka: Running kernel does not have realtime capabilities.` | Non-RT kernel, and libfranka set to enforce RT | Path B patches: §3.2 (examples), §4.3 (Polymetis, then rebuild §4.4) |
 | `unable to set realtime scheduling` / `Operation not permitted` | No RT permissions | §1.3, then log out and in; `ulimit -r` must print 99 |
 | `libfranka: Incompatible library version (server version: X, library version: Y)` | libfranka doesn't match the FR3 system version | Pick a matching version (§1.1), rebuild §3 and §4 |
-| `communication_constraints_violation`, lost packets | Timing too poor: no RT kernel, power saving, USB-Ethernet adapter, a switch in the path, or heavy load | §1.4–1.6; close other programs; if still frequent, Path A (§1.2) |
+| `communication_constraints_violation`, lost packets | Timing too poor: no RT kernel, power saving, Ethernet EEE, `run_server` at normal priority, USB-Ethernet adapter, a switch in the path, or heavy load | §1.4–1.6 and the latency settings in §12.1–12.2; close other programs; if still frequent, Path A (§1.2) |
 | `pathspec '<version>' did not match` in `build_libfranka.sh` | Submodule has no tags yet | `git -C …/third_party/libfranka fetch --tags`, rerun (§4.2) |
 | Polymetis build errors in `franka_panda_client` | libfranka API change | Patch small renames. If it needs real porting → switch to REAL_ROBOT_FR3_GUIDE.md |
 | `'uint8_t' does not name a type` (or similar) in libfranka | Old libfranka, new compiler | Add `#include <cstdint>` to that header, rebuild |

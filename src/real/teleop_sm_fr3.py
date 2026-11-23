@@ -9,6 +9,9 @@ Changes from teleop_sm.py, see docs/FR3_ORIGINAL_CODE_TELEOP_TEST.md §8:
 - --no_gripper: no gripper server; a stand-in gripper reports the commanded width.
 - The ` key (CollectEnum.SKILL) marks the insertion start: the next recorded step gets 1
   in the pickle's `skills`, every other step 0. segment_demos.py cuts phases at the first mark.
+- --show_cameras: live wrist | front window built from the frames the loop already captured
+  (no extra camera reads, recorded data unchanged).
+- Loop timing (work per step, display, late steps) is printed at the end of every run.
 """
 
 from pathlib import Path
@@ -46,7 +49,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-p", "--port_vis", type=int, default=6000)
 parser.add_argument("--frequency", type=int, default=10)  # 30
 parser.add_argument("--command_latency", type=float, default=0.01)
-parser.add_argument("--deadzone", type=float, default=0.05)
+parser.add_argument("--deadzone", type=float, default=0.15)
 parser.add_argument("--max_pos_speed", type=float, default=0.2)
 parser.add_argument("--max_rot_speed", type=float, default=0.5)
 parser.add_argument("--use_lcm", action="store_true")
@@ -55,6 +58,7 @@ parser.add_argument("--furniture", type=str, required=True)
 parser.add_argument("--server_ip", type=str, default="localhost")  # Polymetis server
 parser.add_argument("--no_cameras", action="store_true")
 parser.add_argument("--no_gripper", action="store_true")
+parser.add_argument("--show_cameras", action="store_true")  # live wrist | front window
 
 args = parser.parse_args()
 
@@ -143,6 +147,99 @@ class NoGripper:
 
     def get_state(self):
         return self._State(self._width)
+
+
+class CameraView:
+    """Live wrist | front window for --show_cameras.
+
+    Shows the frames get_observation() already captured, so there are no extra camera reads,
+    and nothing it does changes the recorded data. Each camera is shown at 320x240 as the
+    policy data has it: the wrist frame resized whole (process_pickles' resize), the front frame
+    cut to its central 4:3 part first (resize_crop). The yellow box on the front view is the
+    224x224 center crop the policy sees at deployment. Any display error turns the window off
+    instead of ending the episode.
+    """
+
+    WIN = "teleop cameras: wrist | front"
+
+    def __init__(self):
+        self.enabled = False
+        try:
+            import os
+            import cv2  # only needed with --show_cameras
+
+            # opencv-python points Qt at a font folder it doesn't ship, which floods the
+            # terminal with warnings; use the system's DejaVu fonts when they are there
+            if os.path.isdir("/usr/share/fonts/truetype/dejavu"):
+                os.environ["QT_QPA_FONTDIR"] = "/usr/share/fonts/truetype/dejavu"
+            self.cv2 = cv2
+            cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)  # can be resized with the mouse
+            cv2.resizeWindow(self.WIN, 960, 393)
+            self.enabled = True
+        except Exception as e:
+            print(f"--show_cameras: can't open a window, continuing without it ({e})")
+
+    def _fit(self, img, crop_43):
+        h, w = img.shape[:2]
+        if crop_43 and w * 3 > h * 4:  # keep the central 4:3 part, as resize_crop does
+            w43 = h * 4 // 3
+            x0 = (w - w43) // 2
+            img = img[:, x0 : x0 + w43]
+        return self.cv2.resize(img, (320, 240), interpolation=self.cv2.INTER_AREA)
+
+    def show(self, obs, n_recorded, recorded, gripper_open, mark_text, loop_ms):
+        if not self.enabled:
+            return
+        cv2 = self.cv2
+        try:
+            wrist = self._fit(obs["color_image1"], crop_43=False)
+            front = self._fit(obs["color_image2"], crop_43=True)
+            frame = cv2.cvtColor(np.hstack([wrist, front]), cv2.COLOR_RGB2BGR)
+            cv2.rectangle(frame, (320 + 48, 8), (320 + 271, 231), (0, 255, 255), 1)
+            frame = np.vstack([frame, np.zeros((22, 640, 3), dtype=np.uint8)])
+
+            width_cm = 100 * float(np.ravel(obs["robot_state"]["gripper_width"])[0])
+            items = [
+                (f"REC {n_recorded}" if recorded else f"idle {n_recorded}",
+                 (0, 0, 255) if recorded else (160, 160, 160)),
+                (f"grip {'open' if gripper_open else 'closed'} {width_cm:.1f}cm", (255, 255, 255)),
+                (mark_text, (0, 255, 0) if mark_text.startswith("mark") else (160, 160, 160)),
+                (f"loop {loop_ms:.0f}ms", (0, 165, 255) if loop_ms > 50 else (255, 255, 255)),
+            ]
+            x = 6
+            for text, color in items:
+                cv2.putText(frame, text, (x, 256), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1,
+                            cv2.LINE_AA)
+                x += 160
+            cv2.imshow(self.WIN, frame)
+            # Lets the window refresh (~6 ms, most of the cost). Keys still reach the global
+            # keyboard listener while the window has focus.
+            cv2.pollKey()
+        except Exception as e:
+            print(f"--show_cameras: display error, turning the window off ({e})")
+            self.enabled = False
+
+    def close(self):
+        if self.enabled:
+            self.cv2.destroyAllWindows()
+
+
+def print_loop_timing(work_ms, display_ms, late_ms, dt):
+    """Summary of the 10 Hz loop: time spent per step and how late steps started."""
+    if not work_ms:
+        return
+    work, late = np.array(work_ms), np.array(late_ms)
+    print(
+        f"Loop timing over {len(work)} steps: work mean {work.mean():.1f} ms, "
+        f"p95 {np.percentile(work, 95):.1f} ms, max {work.max():.1f} ms (budget {1000 * dt:.0f} ms)"
+    )
+    if display_ms:
+        disp = np.array(display_ms)
+        print(f"  camera window: mean {disp.mean():.1f} ms, max {disp.max():.1f} ms")
+    print(
+        f"  steps that started more than 5 ms late: {(late > 5).sum()} "
+        f"(max {late.max():.1f} ms late)"
+    )
 
 
 class ActionContainer:
@@ -587,12 +684,16 @@ def main():
             # recorded, so the mark waits for the next recorded step
             mark_pending = False
             prev_skill = False
+            view = CameraView() if args.show_cameras else None
+            work_ms, display_ms, late_ms = [], [], []
             while not stop:
                 # calculate timing
                 t_cycle_end = t_start + (iter_idx + 1) * dt
                 t_sample = t_cycle_end - command_latency
                 # t_command_target = t_cycle_end + dt
                 precise_wait(t_sample)
+                t_work = time.monotonic()
+                late_ms.append(1000 * (t_work - t_sample))
 
                 # get robot state/image observation
                 observation = obs_act_helper.get_observation()
@@ -665,12 +766,33 @@ def main():
                     f"scene/current_pose",
                     poly_util.polypose2mat(robot.get_ee_pose()),
                 )
+                work_ms.append(1000 * (time.monotonic() - t_work))
+
+                if view is not None:
+                    t_disp = time.monotonic()
+                    marks = [i for i, s in enumerate(episode_data["skills"]) if s]
+                    mark_text = (
+                        f"mark @ step {marks[0]}" if marks
+                        else "mark pending" if mark_pending else "no mark"
+                    )
+                    view.show(
+                        observation,
+                        n_recorded=len(episode_data["actions"]),
+                        recorded=action_taken,
+                        gripper_open=obs_act_helper.gripper_open,
+                        mark_text=mark_text,
+                        loop_ms=work_ms[-1] + (display_ms[-1] if display_ms else 0.0),
+                    )
+                    display_ms.append(1000 * (time.monotonic() - t_disp))
 
                 precise_wait(t_cycle_end)
                 iter_idx += 1
+            if view is not None:
+                view.close()
 
     global_total_time = time.time() - global_start_time
     print(f"Time elapsed: {global_total_time}")
+    print_loop_timing(work_ms, display_ms, late_ms, dt)
     if collect_enum == CollectEnum.SUCCESS:
         marks = [i for i, s in enumerate(episode_data["skills"]) if s]
         if marks:
