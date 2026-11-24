@@ -768,6 +768,8 @@ git diff src/real/teleop_sm.py
 | `--server_ip` option, default `localhost` | Change 2 as an option instead of a fixed value. Only needed if the Polymetis server runs on another PC |
 | `--no_gripper` option | Starts without a gripper server. A stand-in gripper (class `NoGripper`) accepts the open/close commands and reports the commanded width as `gripper_width`: 6.5 cm when open, 0 after "close" (the Franka Hand closes fully when there's nothing to grasp) |
 | `` ` `` key: insertion mark | Records `skills` in each episode: 1 on the step recorded after a `` ` `` press, 0 elsewhere. Marks the insertion start so `segment_demos.py` can cut insert and screw out of the full demo later. See [4_REAL_ROBOT_FR3_GUIDE.md](4_REAL_ROBOT_FR3_GUIDE.md) §6 |
+| `--twist_deadzone` option, default `0.5` | Keeps the leg vertical while screwing. While you twist the SpaceMouse cap (rotation about z), the other five axes are ignored unless pushed past this value (SpaceMouse values run from -1 to 1). Twisting counts once the twist reaches the value or is the strongest input, so a slight accidental twist during a normal move changes nothing. `0` turns it off |
+| `--max_twist_speed` option, default = `--max_rot_speed` | Speed of the twist (rotation about z, for screwing) on its own; tilts keep `--max_rot_speed`. Same units as `--max_rot_speed`: at full deflection the **command** turns at value × 4 rad/s (the SpaceMouse rotation scalar), e.g. 0.6 → 138°/s. **The arm follows only about 30% of it** (measured on 2026-11-24: 2–4° per step for 7–14° commanded, the same ratio in free space, while screwing, and in the authors' data), because the target is re-anchored to the measured pose every step and joint 7 has the softest gains (Kq 40, Kqd 8). So the real twist rate is about 0.3 × the command and grows linearly with the value; the authors' 0.7 gave about 58°/s while screwing. The script prints both rates at startup and warns when a full twist asks joint 7 for more than 10 Nm (FR3 limit 12 Nm; 0.7 gives about 11 Nm) |
 | `--show_cameras` option | Opens a live window with the wrist and front cameras side by side (details below). Off by default |
 | Loop timing | At the end of every run, prints the time each 10 Hz step took and how many steps started late (details below) |
 
@@ -1057,6 +1059,24 @@ Repeat checks a, b, g and h from §9.2. Move around for at least 30 s before pre
    - The motion is smooth, with no frozen or skipped stretches.
 
 **✅ Go/no-go 11:** the pickle has real images, processes into a zarr, and the video looks right. **At this point the original code works on your FR3 for teleop, with cameras.** Next: build the scene (REAL_ROBOT_FR3_GUIDE.md §5.2) and collect real demos (§6 there).
+
+### 11.7 Fix the camera exposure
+
+With the default auto exposure, the dark scene (black cloth, dark backdrop) makes the cameras overexpose the white parts. In the first real demos, 71% of the tabletop face in the front view was clipped to 255 and its holes were invisible, while the renderer shows the same face at about 210 with no clipping. Auto exposure also changes the brightness as the arm moves in and out of view. Fix exposure, gain and white balance once the scene and lights are final, and before collecting D_real.
+
+1. Set up the scene exactly as for recording: lights on, parts placed, arm in view. Close teleop; the tuner needs the cameras.
+2. Run the tuner (in the `polymetis-local` env, from the repo root):
+   ```bash
+   python -m src.real.tune_camera_exposure --sweep    # table + image sheet in scratch/exposure/
+   python -m src.real.tune_camera_exposure            # live tuning, both cameras side by side
+   ```
+   - `--sweep` steps through exposures at a fixed gain and prints, for each, the mean, p99 and clipped share in the front camera's policy crop box and on the whole wrist frame, plus the brightest exposure that doesn't clip.
+   - The live mode shows clipped pixels in red. Drag a rectangle over the tabletop face to measure it. Keys: `1`/`2` select the camera, `a` auto exposure on/off, `e`/`E` exposure, `g`/`G` gain, `b` auto white balance on/off, `w`/`W` white balance, `s` save frames, `p` print the settings, `q` quit. All keys are listed in the script header.
+   - Aim for p99 of about 200–235 on the white parts with no clipped pixels. Keep the exposure at or below 330 (33 ms), or the camera can't keep 30 fps. Move the arm into the front view and over the tabletop to check the wrist camera in its working range.
+3. Paste the `COLOR_SETTINGS` block the tuner prints into [src/real/camera_settings.py](../src/real/camera_settings.py).
+4. Run teleop as usual. At startup it prints the applied values for each camera, e.g. `front camera: exposure 120, gain 64, white balance 4600 K`, and saves them in each episode's `metadata["camera_settings"]`.
+
+`None` in `camera_settings.py` means auto for that setting. The script always sets every option explicitly, because the cameras keep their last settings until they are power-cycled. Use the same settings for every D_real demo and for deployment. Re-tune when the lighting changes.
 
 ---
 

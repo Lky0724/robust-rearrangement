@@ -12,6 +12,12 @@ Changes from teleop_sm.py, see docs/FR3_ORIGINAL_CODE_TELEOP_TEST.md §8:
 - --show_cameras: live wrist | front window built from the frames the loop already captured
   (no extra camera reads, recorded data unchanged).
 - Loop timing (work per step, display, late steps) is printed at the end of every run.
+- --twist_deadzone: while twisting the SpaceMouse cap (rotation about z, for screwing), the
+  other five axes get this larger deadzone, so the leg stays vertical.
+- --max_twist_speed: speed of the twist (rotation about z) on its own; tilts keep --max_rot_speed.
+- Camera exposure, gain and white balance come from src/real/camera_settings.py (fixed values
+  instead of auto exposure, which clips the white parts); the applied values are saved in each
+  episode's metadata["camera_settings"].
 """
 
 from pathlib import Path
@@ -40,6 +46,7 @@ from rdt.image.factory import enable_single_realsense
 # from furniture_bench.utils.scripted_demo_mod import scale_scripted_action  # unused
 
 from src.real.serials import FRONT_CAMERA_SERIAL, WRIST_CAMERA_SERIAL
+from src.real.camera_settings import COLOR_SETTINGS, apply_color_settings
 
 from ipdb import set_trace as bp
 
@@ -50,7 +57,7 @@ parser.add_argument("-p", "--port_vis", type=int, default=6000)
 parser.add_argument("--frequency", type=int, default=10)  # 30
 parser.add_argument("--command_latency", type=float, default=0.01)
 parser.add_argument("--deadzone", type=float, default=0.15)
-parser.add_argument("--max_pos_speed", type=float, default=0.2)
+parser.add_argument("--max_pos_speed", type=float, default=0.3)
 parser.add_argument("--max_rot_speed", type=float, default=0.5)
 parser.add_argument("--use_lcm", action="store_true")
 parser.add_argument("--save_dir", required=True)
@@ -59,6 +66,10 @@ parser.add_argument("--server_ip", type=str, default="localhost")  # Polymetis s
 parser.add_argument("--no_cameras", action="store_true")
 parser.add_argument("--no_gripper", action="store_true")
 parser.add_argument("--show_cameras", action="store_true")  # live wrist | front window
+# Deadzone for the other five axes while twisting (0 = off)
+parser.add_argument("--twist_deadzone", type=float, default=0.3)
+# Twist (rotation about z) speed, same units as --max_rot_speed; default: --max_rot_speed
+parser.add_argument("--max_twist_speed", type=float, default=0.8)
 
 args = parser.parse_args()
 
@@ -147,6 +158,19 @@ class NoGripper:
 
     def get_state(self):
         return self._State(self._width)
+
+
+def apply_twist_deadzone(sm_state: np.ndarray, deadzone: float) -> np.ndarray:
+    """While twisting (rotation about z, index 5), zero the other axes below `deadzone`, so
+    accidental pushes and tilts don't move or tilt the leg while screwing. Twisting counts when
+    the twist is at least `deadzone` or the strongest input, so a slight accidental twist during
+    a normal move changes nothing. A deliberate push above `deadzone` still goes through.
+    Values are in [-1, 1] after the SpaceMouse's own deadzone."""
+    s = np.array(sm_state, dtype=float)
+    twist = abs(s[5])
+    if deadzone > 0 and twist > 0 and (twist >= deadzone or twist >= np.abs(s[:5]).max()):
+        s[:5][np.abs(s[:5]) < deadzone] = 0.0
+    return s
 
 
 class CameraView:
@@ -340,6 +364,7 @@ class ObsActHelper:
     def get_action(self):
         # get teleop command
         sm_state = self.sm.get_motion_state_transformed()
+        sm_state = apply_twist_deadzone(sm_state, args.twist_deadzone)
 
         # scale pos command
         dpos = (
@@ -347,7 +372,10 @@ class ObsActHelper:
         )
 
         # convert and scale rot command
-        drot_xyz = sm_state[3:] * (self.max_rot_speed / self.frequency)
+        # Tilts (about x, y) at --max_rot_speed, the twist (about z) at --max_twist_speed
+        twist_speed = args.max_twist_speed if args.max_twist_speed is not None else self.max_rot_speed
+        rot_speeds = np.array([self.max_rot_speed, self.max_rot_speed, twist_speed])
+        drot_xyz = sm_state[3:] * (rot_speeds / self.frequency)
         drot_rotvec = st.Rotation.from_euler("xyz", drot_xyz).as_rotvec()
         drot_rotvec *= self.sm_drot_scalar
         drot = st.Rotation.from_rotvec(drot_rotvec)
@@ -552,6 +580,18 @@ def main():
     sm_dpos_scalar = np.array([1.8] * 3)
     sm_drot_scalar = np.array([4.0] * 3)
 
+    twist_speed = args.max_twist_speed if args.max_twist_speed is not None else args.max_rot_speed
+    # The command is re-anchored to the measured pose every step, and the arm covers only about
+    # 30% of each step's rotation within the step (joint 7 has the softest gains, Kq 40 / Kqd 8),
+    # in this data and the authors'. The real rate is therefore ~0.3x the commanded one.
+    for label, v in [("tilt", args.max_rot_speed), ("twist", twist_speed)]:
+        cmd = np.rad2deg(v * sm_drot_scalar[0])
+        print(f"SpaceMouse {label} at full deflection: commanded {cmd:.0f} deg/s, arm turns about {0.3 * cmd:.0f} deg/s")
+    # Joint 7 torque at the start of a full-deflection twist step: Kq[6] x commanded step
+    j7_torque = 40.0 * twist_speed * sm_drot_scalar[0] / args.frequency
+    if j7_torque > 10.0:
+        print(f"WARNING: a full twist asks joint 7 for about {j7_torque:.0f} Nm (FR3 limit 12 Nm)")
+
     Kq_new = torch.Tensor([150.0, 120.0, 160.0, 100.0, 110.0, 100.0, 40.0])
     Kqd_new = torch.Tensor([20.0, 20.0, 20.0, 20.0, 12.0, 12.0, 8.0])
 
@@ -563,6 +603,7 @@ def main():
     mc_vis["scene"].delete()
 
     # Setup camera streams
+    camera_settings = None
     if args.no_cameras:
         print("--no_cameras: not opening any camera, saving black placeholder images")
         front_image_pipeline = wrist_image_pipeline = None
@@ -583,6 +624,11 @@ def main():
         time.sleep(1.0)
         wrist_image_pipeline = enable_single_realsense(
             WRIST_CAMERA_SERIAL, ctx, resolution_width, resolution_height, frame_rate
+        )
+        # Fixed exposure/white balance from camera_settings.py (None there = auto)
+        camera_settings = dict(
+            front=apply_color_settings(front_image_pipeline, COLOR_SETTINGS["front"], "front"),
+            wrist=apply_color_settings(wrist_image_pipeline, COLOR_SETTINGS["wrist"], "wrist"),
         )
         time.sleep(1.0)
 
@@ -607,6 +653,7 @@ def main():
         sm_drot_scalar=sm_drot_scalar,
         Kq=Kq_new.cpu().numpy(),
         Kqd=Kqd_new.cpu().numpy(),
+        camera_settings=camera_settings,  # values read back from the cameras; None without cameras
     )
     episode_data["metadata"] = metadata
 
@@ -793,6 +840,12 @@ def main():
     global_total_time = time.time() - global_start_time
     print(f"Time elapsed: {global_total_time}")
     print_loop_timing(work_ms, display_ms, late_ms, dt)
+    # Steps without input aren't recorded, so the episode is shorter than the loop
+    n_rec, n_loop = len(episode_data["actions"]), len(work_ms)
+    print(
+        f"Recorded steps: {n_rec} of {n_loop} loop steps ({100 * n_rec / max(n_loop, 1):.0f}%), "
+        f"{n_rec * dt:.1f} s of motion at {frequency} Hz"
+    )
     if collect_enum == CollectEnum.SUCCESS:
         marks = [i for i, s in enumerate(episode_data["skills"]) if s]
         if marks:
