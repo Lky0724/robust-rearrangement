@@ -42,6 +42,7 @@ EncoderName = Literal[
 
 TaskName = Literal[
     "one_leg",
+    "one_leg_insert_screw",
     "lamp",
     "round_table",
     "desk",

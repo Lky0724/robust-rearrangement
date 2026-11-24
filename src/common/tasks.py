@@ -1,5 +1,6 @@
 task2idx = {
     "one_leg": 8,
+    "one_leg_insert_screw": 8,  # the one_leg furniture, started mid-task (src/gym/insert_screw_env.py)
     "square_table": 8,
     "lamp": 1,
     "round_table": 2,
@@ -39,6 +40,7 @@ timesteps_per_part = 1_000  # Reduced from 1000 to 750 after moving to position 
 
 task_parts = {
     "one_leg": 1,
+    "one_leg_insert_screw": 1,
     "square_table": 4,
     "lamp": 2,
     "round_table": 2,
@@ -57,7 +59,15 @@ def task_timeout(task, n_parts=None):
 
     assert n_parts <= task_parts[task], f"Task {task} only has {task_parts[task]} parts"
 
+    if task in task_max_steps:
+        return task_max_steps[task]
     return n_parts * timesteps_per_part
+
+
+# Episode lengths of tasks that don't start from scratch, instead of n_parts * timesteps_per_part
+task_max_steps = {
+    "one_leg_insert_screw": 700,
+}
 
 
 idx2task = {v: k for k, v in task2idx.items()}

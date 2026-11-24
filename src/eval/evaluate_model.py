@@ -185,6 +185,7 @@ if __name__ == "__main__":
         type=str,
         choices=[
             "one_leg",
+            "one_leg_insert_screw",
             "lamp",
             "round_table",
             "desk",

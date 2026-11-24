@@ -85,6 +85,7 @@ def get_env(
 
 Task = Literal[
     "one_leg",
+    "one_leg_insert_screw",
     "lamp",
     "round_table",
     "mug_rack",
@@ -131,6 +132,13 @@ def get_rl_env(
     else:
         from furniture_bench.envs.furniture_rl_sim_env import FurnitureRLSimEnv
 
+        env_class, furniture = FurnitureRLSimEnv, task
+        if task == "one_leg_insert_screw":
+            # The one_leg furniture, reset to random starts of its insert + screw part
+            from src.gym.insert_screw_env import FurnitureRLSimEnvInsertScrew
+
+            env_class, furniture = FurnitureRLSimEnvInsertScrew, "one_leg"
+
         if not april_tags:
             from furniture_bench.envs import furniture_sim_env
 
@@ -154,8 +162,8 @@ def get_rl_env(
         action_type = "pos" if action_type == "relative" else action_type
 
         with suppress_all_output(not verbose):
-            env = FurnitureRLSimEnv(
-                furniture=task,  # Specifies the type of furniture [lamp | square_table | desk | drawer | cabinet | round_table | stool | chair | one_leg].
+            env = env_class(
+                furniture=furniture,  # Specifies the type of furniture [lamp | square_table | desk | drawer | cabinet | round_table | stool | chair | one_leg].
                 num_envs=num_envs,  # Number of parallel environments.
                 resize_img=resize_img,  # If true, images are resized to 224 x 224.
                 concat_robot_state=concat_robot_state,  # If true, robot state is concatenated to the observation.

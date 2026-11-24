@@ -467,7 +467,7 @@ Things to know before using a segment:
 
 - **The two routes differ in their rotation actions.** Everything else is identical, but the episode-wide rotation scaling (§11, pitfall 4) depends on the array it is given. A segmented zarr keeps the factor of its full demo, and a segmented pickle is scaled over the segment only, so it gets a larger factor (about 1.0 instead of about 0.1 for `insert` in our `med` teleop pickles). Don't mix the two routes in one dataset, and don't mix pickle-route segments with full demos. The released `one_leg` teleop zarrs have no raw pickles on S3, so they can only use the zarr route.
 - **Segments are short for the default horizons.** `insert` has a median of about 40 steps, and with `pred_horizon=32`, `action_horizon=8` the last 24 steps of an episode never appear as an observation, which is most of the insertion. On `teleop/low` that leaves 858 samples from 2057 steps, and 2 of the 50 episodes contribute none. `pred_horizon=16` gives 1657 samples and `pred_horizon=8` gives all 2057. `insert` through `screw` (median about 550 steps) loses little.
-- **Evaluation still starts from a full reset.** A policy trained on `insert` only has seen no grasp or transport, so the success rate from `bc.py`'s evaluation doesn't measure it.
+- **Evaluation still starts from a full reset.** A policy trained on `insert` only has seen no grasp or transport, so the success rate from `bc.py`'s evaluation doesn't measure it. The exception is `insert` through `screw` in sim, which has its own task with mid-task starts (below).
 - **Sim and real starts differ in definition.** Sim starts are geometric (`--start-radius`), real ones are wherever the operator pressed the key. Stopping about 5 cm above the hole before pressing brings the two close.
 - **Zarrs with fewer than 4 episodes don't load for training** (§11, pitfall 9). That only matters for small test cuts.
 
@@ -477,7 +477,7 @@ Things to know before using a segment:
 |---|---|---|
 | Full task, insertion oversampled | The full zarr and its `insert_screw` cut together (`data.data_paths_override` lists both), so those steps are seen twice per epoch | Unchanged, from a full reset. Only valid with zarr-route cuts, whose labels match the full zarr |
 | Two chained policies | `--phase setup --through transport` for the first, `--phase insert --through screw` for the second, both cut at the same marks | Run the first until the end effector is near the pre-insertion pose with the gripper closed, then switch. The first policy's end states and the second's start states come from the same steps |
-| Insert and screw only | The `insert_screw` cut | Bring the robot, holding the leg, to the pre-insertion pose by hand or script, then start the policy |
+| Insert and screw only | The `insert_screw` cut | Real: bring the robot, holding the leg, to the pre-insertion pose by hand or script, then start the policy. Sim: task `one_leg_insert_screw` (below) |
 
 For the first use, the override takes paths relative to `$DATA_DIR_PROCESSED/processed/`:
 
@@ -487,6 +487,29 @@ python -m src.train.bc ... \
 ```
 
 None of these has been tried on real data yet. Train a policy on the full demos as a baseline, since it uses the same recordings. In the first use, a held-out episode's cut can still be in the training set, which makes the test loss slightly optimistic.
+
+**Sim: task `one_leg_insert_screw`.** Train and evaluate a sim `insert --through screw` cut with `task=one_leg_insert_screw` (`-f one_leg_insert_screw` for `evaluate_model`). The task is `one_leg` with another reset ([src/gym/insert_screw_env.py](../src/gym/insert_screw_env.py)): every episode starts where the segment begins, with the leg in the hand above the hole. The furniture, the success check and the observations are those of `one_leg`.
+
+| Part of the scene | At each reset |
+|---|---|
+| Fixture, legs 1-3 | Randomized as in `one_leg` (fixture offset, random pushes) |
+| Table top | Snug in the fixture corner, in one of the two orientations the demos have |
+| Leg 4 and the arm | Grasp, hand orientation and tip position above the hole drawn from the range of the demos' first frames. Joint angles from inverse kinematics, gripper closed |
+
+`randomness` scales the ranges about their centre: `low` 0.5×, `med` 1.2×, `high` 1.5×. Samples that put the leg into the table top, tilt it or stretch the arm further than the demos (after scaling), or have no IK solution are drawn again. After a few physics steps of settling, envs where the leg slipped in the hand or the table top was pushed are reset again. A reset of 512 envs takes about 2 s. Episodes last 700 steps by default (`task_max_steps` in [src/common/tasks.py](../src/common/tasks.py)).
+
+BC rollouts, `evaluate_model` and residual PPO use the task as they are, and its data, rollouts and wandb project live under its own name. For the sim cut of our `med` demos:
+
+```bash
+mkdir -p data/processed/diffik/sim/one_leg_insert_screw/teleop/med/success data/raw/diffik/sim/one_leg_insert_screw/teleop/med
+mv data/processed/diffik/sim/one_leg/teleop/med/success/own51_insert_screw.zarr \
+   data/processed/diffik/sim/one_leg_insert_screw/teleop/med/success/own51.zarr
+mv data/raw/diffik/sim/one_leg/teleop/med/own51_insert_screw data/raw/diffik/sim/one_leg_insert_screw/teleop/med/own51
+mv data/raw/diffik/sim/one_leg/teleop/med/own51_insert_screw_eval data/raw/diffik/sim/one_leg_insert_screw/teleop/med/own51_eval
+python -m src.train.bc +experiment=state/diff_unet task=one_leg_insert_screw randomness=med data.suffix=own51 rollout.max_steps=700 ...
+```
+
+[scripts/check_insert_screw_env.py](../scripts/check_insert_screw_env.py) prints the start parameters of the demos' first frames (copy their min / max into `DEMO_RANGES` to refit the ranges to new demos) and checks the resets: why samples were drawn again, slip while settling, the env starts next to the ranges, how many held-out demo starts fall inside them, and slip while the hand holds still.
 
 ---
 
