@@ -15,6 +15,8 @@ Changes from teleop_sm.py, see docs/FR3_ORIGINAL_CODE_TELEOP_TEST.md §8:
 - --twist_deadzone: while twisting the SpaceMouse cap (rotation about z, for screwing), the
   other five axes get this larger deadzone, so the leg stays vertical.
 - --max_twist_speed: speed of the twist (rotation about z) on its own; tilts keep --max_rot_speed.
+- --interp_hz (off by default): spreads each 10 Hz joint target over the step instead of jumping
+  to it, which removes most of the stop-and-go. Decisions and recording stay at 10 Hz.
 - Camera exposure, gain and white balance come from src/real/camera_settings.py (fixed values
   instead of auto exposure, which clips the white parts); the applied values are saved in each
   episode's metadata["camera_settings"].
@@ -70,6 +72,8 @@ parser.add_argument("--show_cameras", action="store_true")  # live wrist | front
 parser.add_argument("--twist_deadzone", type=float, default=0.3)
 # Twist (rotation about z) speed, same units as --max_rot_speed; default: --max_rot_speed
 parser.add_argument("--max_twist_speed", type=float, default=0.8)
+# Joint target interpolation rate within each 10 Hz step, e.g. 50 (0 = off: one jump per step)
+parser.add_argument("--interp_hz", type=float, default=0.0)
 
 args = parser.parse_args()
 
@@ -246,6 +250,76 @@ class CameraView:
     def close(self):
         if self.enabled:
             self.cv2.destroyAllWindows()
+
+
+def diffik_joint_target(robot, ee_pose_mat, dt):
+    """Joint target for a flange pose target: the same computation as rdt's
+    DiffIKWrapper.update_desired_ee_pose (scalar 1), without sending it to the robot."""
+    q = robot.get_joint_positions()
+    jacobian = robot.robot_model.compute_jacobian(q)
+    ee_velocity_desired = robot.compute_ee_vel_desired(ee_pose_mat, dt_pos=dt, dt_rot=dt)
+    joint_vel_desired = torch.linalg.lstsq(jacobian, ee_velocity_desired).solution
+    return q + joint_vel_desired * dt
+
+
+class JointTargetInterpolator:
+    """--interp_hz: instead of jumping to each step's joint target, send a ramp of targets.
+
+    The ramp starts from the last target sent (so the target never jumps) and reaches the new
+    one after SPAN x dt, i.e. before the next step's camera read; the sub-targets go out while
+    the loop would otherwise sleep. If the next step's target arrives first, the new ramp
+    starts wherever this one got to.
+    """
+
+    SPAN = 0.7  # fraction of the step the ramp takes
+
+    def __init__(self, robot, hz, dt):
+        self.robot = robot
+        self.period = 1.0 / hz
+        self.n = max(1, round(self.SPAN * dt / self.period))  # sub-targets per step
+        self.q_last = robot.get_joint_positions().clone()  # the impedance controller holds here
+        self.q_from = self.q_to = self.q_last
+        self.k = self.n
+        self.next_t = None
+        self.send_ms = []
+        self.completed = []  # per step: did the ramp reach its target before the next one?
+        self.started = False
+
+    def set_target(self, q_new):
+        if self.started:
+            self.completed.append(self.k >= self.n)
+        self.started = True
+        self.q_from, self.q_to = self.q_last, q_new
+        self.k = 0
+        self.next_t = time.monotonic()
+        self._send_due(self.next_t)  # first sub-target right away
+
+    def _send_due(self, t_now):
+        while self.next_t is not None and self.next_t <= t_now and self.k < self.n:
+            self.k += 1
+            q = self.q_from + (self.q_to - self.q_from) * (self.k / self.n)
+            a = time.monotonic()
+            self.robot.update_desired_joint_positions(q)
+            self.send_ms.append(1000 * (time.monotonic() - a))
+            self.q_last = q
+            self.next_t = self.next_t + self.period if self.k < self.n else None
+
+    def wait(self, t_end):
+        """Wait until t_end, sending the sub-targets that fall due meanwhile."""
+        while self.next_t is not None and self.next_t < t_end:
+            precise_wait(self.next_t)
+            self._send_due(time.monotonic())
+        precise_wait(t_end)
+
+    def summary(self):
+        if not self.send_ms:
+            return
+        ms = np.array(self.send_ms)
+        done = np.mean(self.completed) * 100 if self.completed else 100.0
+        print(
+            f"  interpolation: {self.n} sub-targets per step, {len(ms)} sent, "
+            f"send mean {ms.mean():.1f} ms max {ms.max():.1f} ms, ramps completed {done:.0f}%"
+        )
 
 
 def print_loop_timing(work_ms, display_ms, late_ms, dt):
@@ -732,13 +806,18 @@ def main():
             mark_pending = False
             prev_skill = False
             view = CameraView() if args.show_cameras else None
+            interp = None
+            if args.interp_hz > 0:
+                interp = JointTargetInterpolator(robot, args.interp_hz, dt)
+                print(f"--interp_hz {args.interp_hz:g}: {interp.n} joint sub-targets per {1000 * dt:.0f} ms step")
+            wait = interp.wait if interp is not None else precise_wait
             work_ms, display_ms, late_ms = [], [], []
             while not stop:
                 # calculate timing
                 t_cycle_end = t_start + (iter_idx + 1) * dt
                 t_sample = t_cycle_end - command_latency
                 # t_command_target = t_cycle_end + dt
-                precise_wait(t_sample)
+                wait(t_sample)
                 t_work = time.monotonic()
                 late_ms.append(1000 * (t_work - t_sample))
 
@@ -775,9 +854,14 @@ def main():
 
                 # send command to the robot
                 # robot.update_desired_ee_pose(action_next_pose_mat, dt=dt)
-                robot.update_desired_ee_pose(
-                    convert_tip2wrist(action_next_pose_mat), dt=dt
-                )
+                if interp is None:
+                    robot.update_desired_ee_pose(
+                        convert_tip2wrist(action_next_pose_mat), dt=dt
+                    )
+                else:  # same joint target, reached through a ramp
+                    interp.set_target(
+                        diffik_joint_target(robot, convert_tip2wrist(action_next_pose_mat), dt)
+                    )
                 execute_gripper_action(toggle_gripper, is_gripper_open)
 
                 # log the data
@@ -832,7 +916,7 @@ def main():
                     )
                     display_ms.append(1000 * (time.monotonic() - t_disp))
 
-                precise_wait(t_cycle_end)
+                wait(t_cycle_end)
                 iter_idx += 1
             if view is not None:
                 view.close()
@@ -840,6 +924,8 @@ def main():
     global_total_time = time.time() - global_start_time
     print(f"Time elapsed: {global_total_time}")
     print_loop_timing(work_ms, display_ms, late_ms, dt)
+    if interp is not None:
+        interp.summary()
     # Steps without input aren't recorded, so the episode is shorter than the loop
     n_rec, n_loop = len(episode_data["actions"]), len(work_ms)
     print(
